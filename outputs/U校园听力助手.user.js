@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.10
+// @version      0.1.11
 // @description  自动填写并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -15,8 +15,9 @@
   const courseRoute = /^#\/course-v1:Unipus\+nhce_3_vls_1_sz\+2021_08\/courseware\/u([1-8])\//;
   const sectionTitle = /^[1-8]-(?:2 Sharing|3 Listening|4 Viewing|8 More practice in listening)$/i;
   const rolePlayingTitle = /^1-6 Role-playing$/i;
+  const presentingTitle = /^1-7 Presenting$/i;
   const rolePlayingLessons = new Set(['note them down', 'role play it']);
-  const supportedSection = title => sectionTitle.test(title) || rolePlayingTitle.test(title);
+  const supportedSection = title => sectionTitle.test(title) || rolePlayingTitle.test(title) || presentingTitle.test(title);
   const lectureTabs = '#header ul.TabsBox a.topTab';
   const numberedTabs = '#header [class*="circleTabsBox"] a';
   const submitBar = '[class*="submit-bar-pc--container"]';
@@ -40,6 +41,10 @@
     'He won four major dance competitions.',
     'He became famous all over the world.',
   ];
+  const writerInterview = [
+    /he was born in.*in the northeast.*he wrote his first novel in.*he made the film lost in the forest in.*he started making films in.*he stayed in brazil for/,
+    ['a small town', '1993', '2008', '2003', '7'],
+  ];
   const blanks = [
     [/cuba is always going to be my.*generation to generation/, ['home', 'country', 'relatives', 'foreigner', 'speak', 'passed on', 'heat', 'sea', 'happiness']],
     [/baruti was born in the year.*opened an orphanage in/, ['1962', 'fourth', '1990', '1996']],
@@ -48,6 +53,7 @@
     [/went to a club.*westfield shopping center.*south london/, ['danced', 'view', 'fun', 'drink', 'west', 'delicious meal', 'house', 'TV']],
     [/part 1 of the conversation and fill in the blanks.*i went for a walk.*with my boyfriend diego.*by the river/,
       ['It was great', "He's a football player", 'It was really beautiful']],
+    writerInterview,
     [/so many changes when a person comes to college.*(parents around|college life)/, ['programmes', 'very', 'decisions', 'doing laundry', 'Obviously', 'choices', 'ruining', 'get used to', 'opportunities', 'step back']],
     // Units 2–8, Further practice in listening, Passage 2.
     [/people joke that no one in los angeles reads.*book festival.*one of the festival founders/,
@@ -201,7 +207,12 @@
     return section && supportedSection(section.title) ? section : undefined;
   };
   const activeLesson = () => all(lectureTabs).find(el => el.closest('li')?.classList.contains('active'));
-  const supportedRolePlayingLesson = () => rolePlayingLessons.has(normalize(text(activeLesson())));
+  const supportsActiveLesson = title => {
+    const lesson = normalize(text(activeLesson()));
+    if (rolePlayingTitle.test(title)) return rolePlayingLessons.has(lesson);
+    if (presentingTitle.test(title)) return lesson === 'get ideas';
+    return true;
+  };
   const activeCircle = () => document.querySelector(numberedTabs + '.selected');
   const sectionLinks = () => all('li.courseware a[title]').filter(el => supportedSection(el.title));
   const stepLabel = () => text(document.querySelector('#pageLayout [class*="pclayout--step-"]')) || '1/1';
@@ -556,12 +567,18 @@
       .some(el => writable(el) && !usedInputs.has(el) &&
         !el.closest('.video-js, [class*="audio--aplayer"], table[class*="sequence-table"]'));
     const total = choice.length + fields.length + tables.length + selects.length;
+    const section = activeSection()?.title;
+    const [interviewPrompt, interviewAnswers] = writerInterview;
+    if (presentingTitle.test(section) &&
+        (fields.length !== interviewAnswers.length || !interviewPrompt.test(normalize(context)))) {
+      return { total, verified: false, noReference: true };
+    }
     let guessed = 0;
     let examples = 0;
     let unmatchedWriting = false;
     let verified = !unknown;
     const step = Number(stepLabel().split('/')[0]) || 1;
-    const partTwo = rolePlayingTitle.test(activeSection()?.title) &&
+    const partTwo = rolePlayingTitle.test(section) &&
       /part 2 of the conversation and check the ones you hear/.test(normalize(context));
 
     for (const [index, inputs] of choice.entries()) {
@@ -674,7 +691,8 @@
         return 'outside';
       }
       if (!result.total || !result.verified) {
-        save({ state: 'failed', message: result.unmatchedWriting ? '简答题暂无对应草稿' :
+        save({ state: 'failed', message: result.noReference ? '本页暂无已核对的答案' :
+          result.unmatchedWriting ? '简答题暂无对应草稿' :
           result.total ? '题目控件未能读回所填答案' : '未发现支持的答题控件' });
         return 'failed';
       }
@@ -724,16 +742,15 @@
 
   async function runSection(title, signal) {
     if (!await openSection(title, signal)) return false;
-    const isRolePlaying = rolePlayingTitle.test(title);
     for (let leaf = 0; leaf < 32 && !signal.aborted; leaf++) {
       if (activeSection()?.title !== title || (currentUnit && unitOfHash(location.hash) !== currentUnit)) return false;
-      if (isRolePlaying && !supportedRolePlayingLesson()) return true;
+      if (!supportsActiveLesson(title)) return true;
       summarize('运行中：' + taskLabel());
       const before = baseHash();
       const result = await processLeaf(signal);
       if (signal.aborted) return false;
       if (result === 'moved' || baseHash() !== before) continue;
-      const next = nextCircle() ?? (isRolePlaying ? undefined : nextLesson());
+      const next = nextCircle() ?? (sectionTitle.test(title) ? nextLesson() : undefined);
       if (!next) return true;
       if (!await navigate(next, signal)) return false;
     }
@@ -750,7 +767,7 @@
     if (mode === 'sample') {
       const section = activeSection();
       if (!section) return '请打开一页支持填写的教材听力练习';
-      if (rolePlayingTitle.test(section.title) && !supportedRolePlayingLesson()) return '当前标签页没有支持填写的练习';
+      if (!supportsActiveLesson(section.title)) return '当前标签页没有支持填写的练习';
       const result = await processLeaf(signal);
       if (result === 'confirmed') return '本页已有完成记录';
       if (result === 'draft') return '本页已填写';
@@ -908,7 +925,7 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.10';
+    panel.dataset.version = '0.1.11';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
