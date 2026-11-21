@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.11
+// @version      0.1.12
 // @description  自动填写并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -44,6 +44,10 @@
   const writerInterview = [
     /he was born in.*in the northeast.*he wrote his first novel in.*he made the film lost in the forest in.*he started making films in.*he stayed in brazil for/,
     ['a small town', '1993', '2008', '2003', '7'],
+  ];
+  const writerInterviewExpressions = [
+    ['about your childhood', 'wrote your first novel', 'related to your later career', 'that sounds interesting', 'why did you give it up then'],
+    ['yes of course', 'that s a good question'],
   ];
   const blanks = [
     [/cuba is always going to be my.*generation to generation/, ['home', 'country', 'relatives', 'foreigner', 'speak', 'passed on', 'heat', 'sea', 'happiness']],
@@ -568,9 +572,13 @@
         !el.closest('.video-js, [class*="audio--aplayer"], table[class*="sequence-table"]'));
     const total = choice.length + fields.length + tables.length + selects.length;
     const section = activeSection()?.title;
+    const prompt = normalize(context);
+    const presenting = presentingTitle.test(section);
+    const interviewChoices = presenting && /listen to the interview again and check the ones you hear/.test(prompt) &&
+      choice.length === writerInterviewExpressions.length && total === choice.length;
     const [interviewPrompt, interviewAnswers] = writerInterview;
-    if (presentingTitle.test(section) &&
-        (fields.length !== interviewAnswers.length || !interviewPrompt.test(normalize(context)))) {
+    const interviewBlanks = fields.length === interviewAnswers.length && total === fields.length && interviewPrompt.test(prompt);
+    if (presenting && !interviewChoices && !interviewBlanks) {
       return { total, verified: false, noReference: true };
     }
     let guessed = 0;
@@ -579,15 +587,16 @@
     let verified = !unknown;
     const step = Number(stepLabel().split('/')[0]) || 1;
     const partTwo = rolePlayingTitle.test(section) &&
-      /part 2 of the conversation and check the ones you hear/.test(normalize(context));
+      /part 2 of the conversation and check the ones you hear/.test(prompt);
 
     for (const [index, inputs] of choice.entries()) {
       if (signal.aborted || pageBlocked()) return { total, guessed, verified: false };
-      if (!partTwo && inputs.some(input => input.checked)) continue;
-      const hints = partTwo ? rolePlayingExpressions : audioChoices[answerLeaf()]?.[step - 1 + index] ?? [];
-      const count = partTwo ? hints.length : pickCount(inputs, context);
+      const reference = partTwo ? rolePlayingExpressions : interviewChoices ? writerInterviewExpressions[index] : null;
+      if (!reference && inputs.some(input => input.checked)) continue;
+      const hints = reference ?? audioChoices[answerLeaf()]?.[step - 1 + index] ?? [];
+      const count = reference?.length ?? pickCount(inputs, context);
       const result = choiceIndexes(inputs.map(choiceLabel), hints, count);
-      if (partTwo && (result.guessed || inputs[0].type !== 'checkbox' ||
+      if (reference && (result.guessed || inputs.some(input => input.type !== 'checkbox') ||
           inputs.some((input, index) => input.checked && !result.indexes.includes(index)))) {
         verified = false;
         continue;
@@ -925,7 +934,7 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.11';
+    panel.dataset.version = '0.1.12';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
