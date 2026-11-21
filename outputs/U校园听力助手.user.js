@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.3
+// @version      0.1.4
 // @description  自动填写、提交并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -12,7 +12,7 @@
 (() => {
   'use strict';
 
-  const courseRoute = /^#\/course-v1:Unipus\+nhce_3_vls_1_sz\+2021_08\/courseware\/u[1-8]\//;
+  const courseRoute = /^#\/course-v1:Unipus\+nhce_3_vls_1_sz\+2021_08\/courseware\/u([1-8])\//;
   const sectionTitle = /^[1-8]-(?:2 Sharing|3 Listening|4 Viewing|8 More practice in listening)$/i;
   const lectureTabs = '#header ul.TabsBox a.topTab';
   const numberedTabs = '#header [class*="circleTabsBox"] a';
@@ -21,6 +21,9 @@
   const transcriptUrl = 'https://news.culr.edu.cn/wyx/docs/2017-03/20170326101926785482.pdf';
   const scoreReceipt = /本次共完成\s*\d+\s*道题[，,]\s*平均分为\s*\d+/;
   const rateNotice = /操作(?:过于|太)频繁|请休息几分钟后再继续学习/;
+  const attentionLabels = new Map([
+    ['pending', '待确认'], ['failed', '未完成'], ['rate-limited', '限频'], ['recording', '待录音'],
+  ]);
 
   // Unit 1 answers checked against the public course transcript, then keyed by visible text.
   const carlosOrder = [
@@ -182,6 +185,7 @@
   const sectionLinks = () => all('li.courseware a[title]').filter(el => sectionTitle.test(el.title));
   const stepLabel = () => text(document.querySelector('#pageLayout [class*="pclayout--step-"]')) || '1/1';
   const baseHash = () => location.hash.replace(/\/(?:__main|p_\d+)$/, '');
+  const unitOfHash = hash => courseRoute.exec(hash)?.[1] ?? '';
   const answerLeaf = () => baseHash().split('/').at(-1);
   const sameCourse = () => isCourse(new URL(location.href));
   const button = label => shown(submitBar + ' button').find(el => text(el) === label && !el.disabled);
@@ -189,17 +193,21 @@
 
   let controller;
   let currentMode;
+  let currentUnit;
   let state;
   let panelMessage;
+  let attentionSummary;
+  let attentionList;
   let buttons;
   let resumeTimer;
 
   function load() {
+    const defaults = { auto: false, section: '', unitSections: {}, visits: {}, records: {} };
     try {
       const cached = JSON.parse(localStorage.getItem(storageKey) ?? '{}');
-      return { auto: false, section: '', visits: {}, records: {}, ...cached };
+      return { ...defaults, ...cached };
     } catch {
-      return { auto: false, section: '', visits: {}, records: {} };
+      return defaults;
     }
   }
 
@@ -212,6 +220,47 @@
     persist();
   }
 
+  function setSectionCursor(title) {
+    if (currentUnit) {
+      if (title) state.unitSections[currentUnit] = title;
+      else delete state.unitSections[currentUnit];
+    } else {
+      state.section = title;
+    }
+  }
+
+  function renderAttention() {
+    const records = Object.values(state.records).filter(record => attentionLabels.has(record.state));
+    attentionSummary.textContent = '待处理（' + records.length + '）';
+    panelMessage.title = records.map(record => record.label + '：' + record.message).join('\n');
+    attentionList.replaceChildren();
+    if (!records.length) {
+      const empty = document.createElement('li');
+      empty.textContent = '暂无待处理任务';
+      attentionList.append(empty);
+      return;
+    }
+
+    for (const record of records) {
+      const row = document.createElement('li');
+      const openPage = document.createElement('button');
+      openPage.type = 'button';
+      openPage.textContent = attentionLabels.get(record.state) + ' · ' + (record.label || '课件页');
+      openPage.disabled = Boolean(controller) || !courseRoute.test(record.hash ?? '');
+      openPage.style.cssText = 'text-align:left;max-width:100%;overflow-wrap:anywhere';
+      openPage.addEventListener('click', () => {
+        if (!controller && sameCourse() && courseRoute.test(record.hash ?? '')) location.hash = record.hash;
+      });
+      row.append(openPage);
+      if (record.message) {
+        const reason = document.createElement('div');
+        reason.textContent = record.message;
+        row.append(reason);
+      }
+      attentionList.append(row);
+    }
+  }
+
   function summarize(prefix) {
     const records = Object.values(state.records);
     const counts = records.reduce((totals, record) => {
@@ -219,13 +268,12 @@
       totals.guessed += record.guessed ?? 0;
       return totals;
     }, { guessed: 0 });
-    const attention = records.filter(record => ['pending', 'failed', 'rate-limited', 'recording'].includes(record.state));
     panelMessage.textContent = prefix + ' | 已确认 ' + (counts.confirmed ?? 0) +
       ' · 猜填 ' + counts.guessed + ' · 待确认 ' + (counts.pending ?? 0) +
       ' · 未完成 ' + (counts.failed ?? 0) +
       ' · 待录音 ' + (counts.recording ?? 0) +
       ((counts['rate-limited'] ?? 0) ? ' · 限频 ' + counts['rate-limited'] : '');
-    panelMessage.title = attention.map(record => record.label + '：' + record.message).join('\n');
+    renderAttention();
   }
 
   function taskLabel() {
@@ -287,13 +335,13 @@
     const previous = state.records[key];
     const section = activeSection()?.title;
     if (section) {
-      state.section = section;
+      setSectionCursor(section);
       delete state.visits[section];
     }
     state.auto = false;
     state.resumeAfter = Date.now() + 5 * 60 * 1000;
     state.resumePlan = state.rateRecoveryUsed ? null : {
-      hash: location.hash, mode: currentMode, after: state.resumeAfter,
+      hash: location.hash, mode: currentMode, unit: currentUnit, after: state.resumeAfter,
     };
     if (previous?.state === 'confirmed') persist();
     else saveRecord(key, { label: taskLabel(), state: 'rate-limited', message: cooldownStatus() });
@@ -654,7 +702,7 @@
   async function runSection(title, signal) {
     if (!await openSection(title, signal)) return false;
     for (let leaf = 0; leaf < 32 && !signal.aborted; leaf++) {
-      if (activeSection()?.title !== title) return false;
+      if (activeSection()?.title !== title || (currentUnit && unitOfHash(location.hash) !== currentUnit)) return false;
       summarize('运行中：' + taskLabel());
       const before = baseHash();
       const result = await processLeaf(signal);
@@ -671,6 +719,7 @@
     for (const [key, record] of Object.entries(state.records)) {
       if (signal.aborted) return;
       if (record.state !== 'pending' || !record.hash || !courseRoute.test(record.hash)) continue;
+      if (currentUnit && unitOfHash(record.hash) !== currentUnit) continue;
       if (baseHash() !== key) {
         location.hash = record.hash;
         if (!await until(() => baseHash() === key, 7000, signal) || !await stablePage(signal)) continue;
@@ -680,6 +729,7 @@
   }
 
   async function run(mode, signal) {
+    if (currentUnit && unitOfHash(location.hash) !== currentUnit) return '请回到 Unit ' + currentUnit + ' 再继续';
     if (inspectReceipt() === 'rate-limited') {
       pauseForRateLimit();
       return ratePauseMessage;
@@ -694,13 +744,15 @@
       return next ? '验收页已提交，切页尚未确认' : '验收页已提交';
     }
 
-    const sections = [...new Set(sectionLinks().map(link => link.title))];
+    const sections = [...new Set(sectionLinks().map(link => link.title))]
+      .filter(title => !currentUnit || title.startsWith(currentUnit + '-'));
     if (!sections.length) return '没有读到教材听力目录';
-    const index = Math.max(0, sections.indexOf(state.section));
+    const cursor = currentUnit ? state.unitSections[currentUnit] : state.section;
+    const index = Math.max(0, sections.indexOf(cursor));
     for (const title of sections.slice(index)) {
       if (signal.aborted) return '已停止';
       if (state.visits[title] === 'finished') continue;
-      state.section = title;
+      setSectionCursor(title);
       persist();
       const done = await runSection(title, signal);
       if (signal.aborted) return '已停止';
@@ -709,11 +761,13 @@
     }
     if (!signal.aborted) await revisit(signal);
     if (!signal.aborted) {
-      state.section = '';
+      setSectionCursor('');
       persist();
     }
-    const unreachable = Object.values(state.visits).filter(result => result === 'unreached').length;
-    return signal.aborted ? '已停止' : unreachable ? '本轮结束，未走完小节 ' + unreachable : '教材听力目录已遍历';
+    const unreachable = sections.filter(title => state.visits[title] === 'unreached').length;
+    if (signal.aborted) return '已停止';
+    if (unreachable) return (currentUnit ? 'Unit ' + currentUnit + ' ' : '') + '本轮结束，未走完小节 ' + unreachable;
+    return currentUnit ? 'Unit ' + currentUnit + ' 听力目录已遍历' : '教材听力目录已遍历';
   }
 
   async function start(mode, scheduledPlan = null, reopening = false) {
@@ -724,8 +778,10 @@
     currentMode = mode;
     const { signal } = controller;
     buttons.sample.disabled = true;
+    buttons.unit.disabled = true;
     buttons.start.disabled = true;
     buttons.stop.disabled = false;
+    renderAttention();
     let reschedule = true;
     try {
       await navigator.locks.request(storageKey, { ifAvailable: true }, async lock => {
@@ -744,9 +800,18 @@
             location.hash !== scheduledPlan.hash || !sameCourse())) {
           return;
         }
+        currentUnit = mode === 'unit'
+          ? scheduledPlan?.unit ?? (reopening ? state.activeUnit : unitOfHash(location.hash))
+          : '';
+        if (mode === 'unit' && (!currentUnit || currentUnit !== unitOfHash(location.hash))) {
+          summarize(currentUnit ? '请回到 Unit ' + currentUnit + ' 再继续' : '未识别当前单元');
+          return;
+        }
         state.resumePlan = null;
         if (!reopening) state.rateRecoveryUsed = Boolean(scheduledPlan);
-        state.auto = mode === 'all';
+        state.auto = mode !== 'sample';
+        state.autoMode = mode;
+        state.activeUnit = currentUnit;
         persist();
         summarize('正在准备');
         let message;
@@ -772,9 +837,12 @@
     } finally {
       controller = undefined;
       currentMode = undefined;
+      currentUnit = undefined;
       buttons.sample.disabled = false;
+      buttons.unit.disabled = false;
       buttons.start.disabled = false;
       buttons.stop.disabled = !state.resumePlan;
+      renderAttention();
       if (reschedule) scheduleResume();
     }
   }
@@ -782,8 +850,8 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.3';
-    panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
+    panel.dataset.version = '0.1.4';
+    panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
     title.textContent = 'U校园听力助手';
@@ -799,6 +867,7 @@
     };
     buttons = {
       sample: makeButton('验收本页', () => start('sample')),
+      unit: makeButton('只跑本单元', () => start('unit')),
       start: makeButton('开始全自动', () => start('all')),
       stop: makeButton('停止', () => {
         if (!controller) state = load();
@@ -815,8 +884,15 @@
     actions.append(...Object.values(buttons));
     panelMessage = document.createElement('div');
     panelMessage.setAttribute('role', 'status');
-    panelMessage.style.cssText = 'max-width:360px;overflow-wrap:anywhere';
-    panel.append(title, actions, panelMessage);
+    panelMessage.style.cssText = 'overflow-wrap:anywhere';
+    const attention = document.createElement('details');
+    attention.style.marginTop = '5px';
+    attentionSummary = document.createElement('summary');
+    attentionSummary.style.cursor = 'pointer';
+    attentionList = document.createElement('ul');
+    attentionList.style.cssText = 'max-height:min(40vh,250px);overflow:auto;margin:4px 0 0;padding:0 0 0 20px';
+    attention.append(attentionSummary, attentionList);
+    panel.append(title, actions, panelMessage, attention);
     document.body.append(panel);
     state = load();
     summarize(state.resumeAfter > Date.now() || state.resumePlan ? cooldownStatus() : '就绪');
@@ -830,7 +906,9 @@
       scheduleResume();
     });
     if (state.resumePlan) scheduleResume();
-    else if (state.auto && !(state.resumeAfter > Date.now())) void start('all', null, true);
+    else if (state.auto && !(state.resumeAfter > Date.now())) {
+      void start(state.autoMode === 'unit' ? 'unit' : 'all', null, true);
+    }
   }
 
   mount();
