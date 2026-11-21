@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.12
+// @version      0.1.13
 // @description  自动填写并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -16,8 +16,15 @@
   const sectionTitle = /^[1-8]-(?:2 Sharing|3 Listening|4 Viewing|8 More practice in listening)$/i;
   const rolePlayingTitle = /^1-6 Role-playing$/i;
   const presentingTitle = /^1-7 Presenting$/i;
-  const rolePlayingLessons = new Set(['note them down', 'role play it']);
-  const supportedSection = title => sectionTitle.test(title) || rolePlayingTitle.test(title) || presentingTitle.test(title);
+  const leadInTitle = /^1-9 Lead-in$/i;
+  const worldStoryTitle = /^1-10 World story$/i;
+  const limitedLessons = [
+    [rolePlayingTitle, ['note them down', 'role play it']],
+    [presentingTitle, ['get ideas', 'organize ideas', 'present ideas']],
+    [leadInTitle, ['quiz']],
+    [worldStoryTitle, ['viewing and understanding', 'speaking']],
+  ];
+  const supportedSection = title => sectionTitle.test(title) || limitedLessons.some(([section]) => section.test(title));
   const lectureTabs = '#header ul.TabsBox a.topTab';
   const numberedTabs = '#header [class*="circleTabsBox"] a';
   const submitBar = '[class*="submit-bar-pc--container"]';
@@ -48,6 +55,17 @@
   const writerInterviewExpressions = [
     ['about your childhood', 'wrote your first novel', 'related to your later career', 'that sounds interesting', 'why did you give it up then'],
     ['yes of course', 'that s a good question'],
+  ];
+  const profileNotes = [
+    ['lewis hamilton', 'Lewis Hamilton was born in 1985. As a child, he raced radio-controlled cars and finished second in a national competition. McLaren later supported his development, and he made his Formula One debut with the team in 2007.'],
+    ['shakira', 'Shakira is a singer and songwriter from Barranquilla, Colombia. She began writing songs as a child. She also founded Pies Descalzos, which supports education for children in Colombia.'],
+  ];
+  const profilePrompt = /information about lewis hamilton.*information about shakira/;
+  const moralEducationQuizzes = [
+    [leadInTitle, /what kind of picture do you think it is.*which of the following activities do you find in the picture/,
+      [['cliff painting'], ['hunting']]],
+    [worldStoryTitle, /ancient cave paintings found in spain.*more lasting than themselves.*handprint found in the first cave/,
+      [['beyond their basic demands'], ['37 000 years old', '37000 years old']]],
   ];
   const blanks = [
     [/cuba is always going to be my.*generation to generation/, ['home', 'country', 'relatives', 'foreigner', 'speak', 'passed on', 'heat', 'sea', 'happiness']],
@@ -134,6 +152,11 @@
 
   function writtenAnswer(context, question, index, count) {
     const prompt = normalize(context);
+    if (count === profileNotes.length && profilePrompt.test(prompt)) {
+      const nearby = normalize(question);
+      const profile = profileNotes.find(([name]) => nearby.includes(name)) ?? profileNotes[index];
+      return { text: profile[1], example: true };
+    }
     if (count === 1 && /someone in your family that you like most/.test(prompt) &&
         /what you have learned/.test(prompt)) {
       return {
@@ -211,11 +234,9 @@
     return section && supportedSection(section.title) ? section : undefined;
   };
   const activeLesson = () => all(lectureTabs).find(el => el.closest('li')?.classList.contains('active'));
-  const supportsActiveLesson = title => {
-    const lesson = normalize(text(activeLesson()));
-    if (rolePlayingTitle.test(title)) return rolePlayingLessons.has(lesson);
-    if (presentingTitle.test(title)) return lesson === 'get ideas';
-    return true;
+  const supportsLesson = (title, tab = activeLesson()) => {
+    const allowed = limitedLessons.find(([section]) => section.test(title));
+    return !allowed || allowed[1].includes(normalize(text(tab)));
   };
   const activeCircle = () => document.querySelector(numberedTabs + '.selected');
   const sectionLinks = () => all('li.courseware a[title]').filter(el => supportedSection(el.title));
@@ -578,12 +599,18 @@
       choice.length === writerInterviewExpressions.length && total === choice.length;
     const [interviewPrompt, interviewAnswers] = writerInterview;
     const interviewBlanks = fields.length === interviewAnswers.length && total === fields.length && interviewPrompt.test(prompt);
-    if (presenting && !interviewChoices && !interviewBlanks) {
+    const profileWriting = presenting && profilePrompt.test(prompt) && total === profileNotes.length &&
+      fields.length === profileNotes.length && fields.every(input => input.tagName === 'TEXTAREA');
+    const quiz = moralEducationQuizzes.find(([title]) => title.test(section));
+    if ((presenting && !interviewChoices && !interviewBlanks && !profileWriting) ||
+        (quiz && (!quiz[1].test(prompt) || !choice.length || total !== choice.length))) {
       return { total, verified: false, noReference: true };
     }
     let guessed = 0;
     let examples = 0;
     let unmatchedWriting = false;
+    let noReference = false;
+    let missingQuizAnswers = false;
     let verified = !unknown;
     const step = Number(stepLabel().split('/')[0]) || 1;
     const partTwo = rolePlayingTitle.test(section) &&
@@ -591,13 +618,18 @@
 
     for (const [index, inputs] of choice.entries()) {
       if (signal.aborted || pageBlocked()) return { total, guessed, verified: false };
-      const reference = partTwo ? rolePlayingExpressions : interviewChoices ? writerInterviewExpressions[index] : null;
+      const reference = partTwo ? rolePlayingExpressions : interviewChoices ? writerInterviewExpressions[index] : quiz?.[2][index];
+      if (quiz && !reference) {
+        if (!inputs.some(input => input.checked)) { verified = false; missingQuizAnswers = true; }
+        continue;
+      }
       if (!reference && inputs.some(input => input.checked)) continue;
       const hints = reference ?? audioChoices[answerLeaf()]?.[step - 1 + index] ?? [];
-      const count = reference?.length ?? pickCount(inputs, context);
+      const count = quiz ? 1 : reference?.length ?? pickCount(inputs, context);
       const result = choiceIndexes(inputs.map(choiceLabel), hints, count);
-      if (reference && (result.guessed || inputs.some(input => input.type !== 'checkbox') ||
+      if (reference && (result.guessed || inputs.some(input => input.type !== (quiz ? 'radio' : 'checkbox')) ||
           inputs.some((input, index) => input.checked && !result.indexes.includes(index)))) {
+        if (result.guessed) noReference = true;
         verified = false;
         continue;
       }
@@ -653,7 +685,7 @@
       verified = result.verified && verified;
       guessed += result.guessed;
     }
-    return { total, guessed, examples, unmatchedWriting, verified };
+    return { total, guessed, examples, unmatchedWriting, verified, noReference, missingQuizAnswers, profileWriting };
   }
 
   async function processLeaf(signal) {
@@ -679,7 +711,7 @@
       if (!root) return 'outside';
       const prompt = text(root);
       const chooseRole = /To start recording,\s*select a role/i.test(prompt);
-      if (chooseRole || /Repeat and learn to use them|To start recording,\s*click/i.test(prompt) ||
+      if (chooseRole || /Repeat and learn to use them|To start recording,\s*click|and then record the sentences/i.test(prompt) ||
           shown('[class*="sentencesToRead--record-wrap"]', root).length) {
         save({ state: 'recording', message: chooseRole ? '待录音，请在课程页选择角色并用麦克风录音' :
           '待录音，请在课程页使用麦克风完成跟读' });
@@ -694,13 +726,14 @@
       }, interrupted);
       if (signal.aborted || pageBlocked()) return 'stopped';
       if (baseHash() !== key) return 'moved';
-      const next = button('下一题');
+      const next = result.profileWriting ? undefined : button('下一题');
       if (!result.total && result.verified && !button('提交') && !next) {
         save({ state: 'reference', message: '本页没有可填写的练习' });
         return 'outside';
       }
       if (!result.total || !result.verified) {
         save({ state: 'failed', message: result.noReference ? '本页暂无已核对的答案' :
+          result.missingQuizAnswers ? '本页有题目暂无已核对的答案，已填写能匹配的题目' :
           result.unmatchedWriting ? '简答题暂无对应草稿' :
           result.total ? '题目控件未能读回所填答案' : '未发现支持的答题控件' });
         return 'failed';
@@ -732,10 +765,10 @@
     return current >= 0 ? pages[current + 1] : undefined;
   }
 
-  function nextLesson() {
+  function nextLesson(title) {
     const tabs = shown(lectureTabs);
     const current = tabs.findIndex(el => el === activeLesson());
-    return current >= 0 ? tabs[current + 1] : undefined;
+    return current >= 0 ? tabs.slice(current + 1).find(tab => supportsLesson(title, tab)) : undefined;
   }
 
   async function openSection(title, signal) {
@@ -753,13 +786,18 @@
     if (!await openSection(title, signal)) return false;
     for (let leaf = 0; leaf < 32 && !signal.aborted; leaf++) {
       if (activeSection()?.title !== title || (currentUnit && unitOfHash(location.hash) !== currentUnit)) return false;
-      if (!supportsActiveLesson(title)) return true;
+      if (!supportsLesson(title)) {
+        const next = rolePlayingTitle.test(title) ? undefined : nextLesson(title);
+        if (!next) return true;
+        if (!await navigate(next, signal)) return false;
+        continue;
+      }
       summarize('运行中：' + taskLabel());
       const before = baseHash();
       const result = await processLeaf(signal);
       if (signal.aborted) return false;
       if (result === 'moved' || baseHash() !== before) continue;
-      const next = nextCircle() ?? (sectionTitle.test(title) ? nextLesson() : undefined);
+      const next = nextCircle() ?? (rolePlayingTitle.test(title) ? undefined : nextLesson(title));
       if (!next) return true;
       if (!await navigate(next, signal)) return false;
     }
@@ -776,7 +814,7 @@
     if (mode === 'sample') {
       const section = activeSection();
       if (!section) return '请打开一页支持填写的教材听力练习';
-      if (!supportsActiveLesson(section.title)) return '当前标签页没有支持填写的练习';
+      if (!supportsLesson(section.title)) return '当前标签页没有支持填写的练习';
       const result = await processLeaf(signal);
       if (result === 'confirmed') return '本页已有完成记录';
       if (result === 'draft') return '本页已填写';
@@ -934,7 +972,7 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.12';
+    panel.dataset.version = '0.1.13';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
