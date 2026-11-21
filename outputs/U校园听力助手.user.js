@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.14
+// @version      0.1.15
 // @description  自动填写并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -69,6 +69,10 @@
     [worldStoryTitle, [
       [/more lasting than themselves/, /\bbeyond their basic demands\b/, /\bmore food\b/],
       [/hand\s?print found in the first cave/, /\b37\s?000 years old\b/, /\b73\s?000 years old\b/],
+      [/woman s speech about the hand\s?print/, /\bkind of ancient human language\b/, /\bafter humans had written language\b/],
+      [/cognitive revolution.*creative slumber/, /\bcreativity of early humans was inspired by the cognitive development\b/,
+        /\bwoken up to recognize the beauty\b/],
+      [/story of pablo picasso/, /^art can go beyond time$/, /^practice makes perfect$/],
     ]],
   ];
   const blanks = [
@@ -1026,7 +1030,7 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.14';
+    panel.dataset.version = '0.1.15';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
