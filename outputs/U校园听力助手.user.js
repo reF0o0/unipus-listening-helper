@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.1
+// @version      0.1.2
 // @description  自动填写、提交并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -110,6 +110,7 @@
 
   function receiptState({ pageClass = '', info = '', modal = '', hasSubmit = false }) {
     const statusText = [info, modal].join(' ').trim();
+    if (/操作(?:过于|太)频繁|请休息几分钟后再继续学习/.test(statusText)) return 'rate-limited';
     if (/还有\s*\d+\s*道题没有作答/.test(statusText)) return 'incomplete';
     if (/尚未提交|仍未提交|提交未受理|本次答案未提交/.test(statusText)) return 'rejected';
     if (scoreReceipt.test(modal) ||
@@ -122,6 +123,7 @@
   }
 
   function decideSubmit(record, receipt) {
+    if (receipt === 'rate-limited') return 'hold';
     if (record?.state === 'confirmed' || ['confirmed', 'already'].includes(receipt)) return 'finish';
     if (record?.state !== 'pending') return 'submit';
     if (receipt !== 'rejected') return 'observe';
@@ -215,10 +217,12 @@
       totals.guessed += record.guessed ?? 0;
       return totals;
     }, { guessed: 0 });
-    const attention = records.filter(record => ['pending', 'failed'].includes(record.state));
+    const attention = records.filter(record => ['pending', 'failed', 'rate-limited', 'recording'].includes(record.state));
     panelMessage.textContent = prefix + ' | 已确认 ' + (counts.confirmed ?? 0) +
       ' · 猜填 ' + counts.guessed + ' · 待确认 ' + (counts.pending ?? 0) +
-      ' · 未完成 ' + (counts.failed ?? 0);
+      ' · 未完成 ' + (counts.failed ?? 0) +
+      ' · 待录音 ' + (counts.recording ?? 0) +
+      ((counts['rate-limited'] ?? 0) ? ' · 限频 ' + counts['rate-limited'] : '');
     panelMessage.title = attention.map(record => record.label + '：' + record.message).join('\n');
   }
 
@@ -231,9 +235,15 @@
       header.parentElement ? [header.parentElement] : []);
   }
 
-  function dismissStudyNotice() {
+  function dismissStudyNotice(includeRecorderError = false) {
+    if (!sameCourse()) return false;
     const dialogs = visibleDialogs().reverse();
-    const notice = dialogs.find(node => /本单元学习时间|是否必修|录音机初始化错误/.test(text(node)));
+    const notice = dialogs.find(node => {
+      if (/操作(?:过于|太)频繁|提交失败|确认要提交|平均分为/.test(text(node))) return false;
+      const isStudyTip = shown('[class*="taskTipStyle--tipBody"]', node)
+        .some(line => /^(?:本单元学习时间|是否必修)\s*[：:]/.test(text(line)));
+      return isStudyTip || (includeRecorderError && /^录音机初始化错误/.test(text(node)));
+    });
     const ok = notice && shown('button', notice).find(el => text(el) === '确定' && !el.disabled);
     if (ok) ok.click();
     return Boolean(ok);
@@ -246,6 +256,23 @@
       modal: visibleDialogs().map(text).join(' '),
       hasSubmit: Boolean(button('提交')),
     });
+  }
+
+  const ratePauseMessage = '平台限频，已暂停；请等待后手动继续';
+
+  function pauseForRateLimit() {
+    const key = baseHash();
+    const previous = state.records[key];
+    const section = activeSection()?.title;
+    if (section) {
+      state.section = section;
+      delete state.visits[section];
+    }
+    state.auto = false;
+    state.resumeAfter = Date.now() + 5 * 60 * 1000;
+    if (previous?.state === 'confirmed') persist();
+    else saveRecord(key, { label: taskLabel(), state: 'rate-limited', message: ratePauseMessage });
+    controller.abort(ratePauseMessage);
   }
 
   async function until(predicate, timeout = 12000, signal = controller?.signal) {
@@ -263,7 +290,7 @@
     let last = '';
     let since = 0;
     return until(() => {
-      if (dismissStudyNotice()) return false;
+      if (dismissStudyNotice(true)) return false;
       const root = pageRoot();
       if (!visible(root) || /\/__main$/.test(location.hash)) return false;
       const snapshot = location.hash + '|' + stepLabel() + '|' + root.childElementCount + '|' + text(root).slice(0, 100);
@@ -488,8 +515,13 @@
       record = { ...record, ...update, label };
       saveRecord(key, record);
     };
+    const receipt = inspectReceipt();
+    if (receipt === 'rate-limited') {
+      pauseForRateLimit();
+      return 'rate-limited';
+    }
     if (record.state === 'confirmed') return 'confirmed';
-    if (['confirmed', 'already'].includes(inspectReceipt())) {
+    if (['confirmed', 'already'].includes(receipt)) {
       save({ state: 'confirmed', message: '平台已确认' });
       return 'confirmed';
     }
@@ -497,6 +529,11 @@
     for (let step = 0; step < 40 && !signal.aborted; step++) {
       if (baseHash() !== key || !sameCourse()) return 'moved';
       const root = pageRoot();
+      if (root && (shown('[class*="sentencesToRead--record-wrap"]', root).length ||
+          /Repeat and learn to use them|To start recording, click/i.test(text(root)))) {
+        save({ state: 'recording', message: '待录音，请在课程页使用麦克风完成跟读' });
+        return 'recording';
+      }
       if (record.state !== 'pending') {
         if (!listeningPage(root)) return 'outside';
         const stepName = stepLabel();
@@ -507,6 +544,10 @@
           save({ state: 'progress', sequencePlans: { ...record.sequencePlans, [stepName]: sequencePlans } });
         }, interrupted);
         if (signal.aborted) return 'stopped';
+        if (!result.total && result.verified && !button('提交') && !button('下一题')) {
+          save({ state: 'reference', message: '本页没有可填写的练习' });
+          return 'outside';
+        }
         if (!result.total || !result.verified) {
           save({ state: 'failed', message: result.total ? '题目控件未能读回所填答案' : '未发现可填写的听力题控件' });
           return 'failed';
@@ -528,6 +569,10 @@
           waitForReceipt: decision => waitForReceipt(key, signal, ['submit', 'retry'].includes(decision)),
         });
         let outcome = await runner.finish(key, previous);
+        if (!signal.aborted && baseHash() === key && inspectReceipt() === 'rate-limited') {
+          pauseForRateLimit();
+          return 'rate-limited';
+        }
         if (!signal.aborted && baseHash() === key && inspectReceipt() === 'incomplete') {
           const dialog = visibleDialogs().reverse().find(el => /还有\s*\d+\s*道题没有作答/.test(text(el)));
           const back = dialog && shown('button', dialog).find(el => /^(?:取消|返回修改)$/.test(text(el)));
@@ -540,6 +585,10 @@
           // The rejection has already been read; keep the result for this single retry.
           runner.inspectReceipt = () => 'rejected';
           outcome = await runner.finish(key, outcome);
+          if (!signal.aborted && baseHash() === key && inspectReceipt() === 'rate-limited') {
+            pauseForRateLimit();
+            return 'rate-limited';
+          }
         }
         if (outcome?.state === 'confirmed') closeReceipt();
         return outcome?.state ?? 'pending';
@@ -606,9 +655,13 @@
   }
 
   async function run(mode, signal) {
+    if (inspectReceipt() === 'rate-limited') {
+      pauseForRateLimit();
+      return ratePauseMessage;
+    }
     if (!await stablePage(signal)) return '等待课件加载超时';
     if (mode === 'sample') {
-      if (!listeningPage(pageRoot()) || !activeSection()) return '请打开一页教材听力练习验收';
+      if (!activeSection()) return '请打开一页教材听力练习验收';
       const result = await processLeaf(signal);
       if (result !== 'confirmed') return '验收页：' + (state.records[baseHash()]?.message ?? '尚未确认');
       const next = nextCircle() ?? nextLesson();
@@ -654,6 +707,10 @@
           summarize(lock ? '已停止' : '另一个标签页正在处理本课程');
           return;
         }
+        if (state.resumeAfter > Date.now()) {
+          summarize('平台限频，约 ' + Math.ceil((state.resumeAfter - Date.now()) / 60000) + ' 分钟后可手动继续');
+          return;
+        }
         state.auto = mode === 'all';
         persist();
         summarize('正在准备');
@@ -664,7 +721,7 @@
           state.auto = false;
           persist();
         }
-        summarize(message);
+        summarize(signal.reason === ratePauseMessage ? ratePauseMessage : message);
       });
     } catch (error) {
       console.warn('[U校园听力助手]', error);
@@ -681,7 +738,7 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.1';
+    panel.dataset.version = '0.1.2';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
@@ -715,8 +772,12 @@
     panel.append(title, actions, panelMessage);
     document.body.append(panel);
     state = load();
-    summarize('就绪');
-    if (state.auto) void start('all');
+    summarize(state.resumeAfter > Date.now() ? ratePauseMessage : '就绪');
+    dismissStudyNotice();
+    new MutationObserver(() => {
+      if (panel.isConnected) dismissStudyNotice();
+    }).observe(document.body, { childList: true, subtree: true });
+    if (state.auto && !(state.resumeAfter > Date.now())) void start('all');
   }
 
   mount();
