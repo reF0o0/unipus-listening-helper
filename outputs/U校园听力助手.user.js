@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.13
+// @version      0.1.14
 // @description  自动填写并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -62,10 +62,14 @@
   ];
   const profilePrompt = /information about lewis hamilton.*information about shakira/;
   const moralEducationQuizzes = [
-    [leadInTitle, /what kind of picture do you think it is.*which of the following activities do you find in the picture/,
-      [['cliff painting'], ['hunting']]],
-    [worldStoryTitle, /ancient cave paintings found in spain.*more lasting than themselves.*handprint found in the first cave/,
-      [['beyond their basic demands'], ['37 000 years old', '37000 years old']]],
+    [leadInTitle, [
+      [/what kind of picture do you think it is/, /\bcliff painting\b/, /\boil painting\b/],
+      [/activities do you find in the picture/, /^hunting$/, /^(?:fishing|cooking)$/],
+    ]],
+    [worldStoryTitle, [
+      [/more lasting than themselves/, /\bbeyond their basic demands\b/, /\bmore food\b/],
+      [/hand\s?print found in the first cave/, /\b37\s?000 years old\b/, /\b73\s?000 years old\b/],
+    ]],
   ];
   const blanks = [
     [/cuba is always going to be my.*generation to generation/, ['home', 'country', 'relatives', 'foreigner', 'speak', 'passed on', 'heat', 'sea', 'happiness']],
@@ -478,9 +482,61 @@
   }
 
   function choiceLabel(input) {
-    const label = input.closest('label');
+    const label = input.labels?.[0] ?? input.closest('label');
     return text(label?.querySelector('[class*="choice--content"], [class*="MultipleChoice--checkbox-content-"]') ?? label)
       .replace(/^[A-Z]\s*[.)]\s*/, '');
+  }
+
+  function quizRadioGroups(root) {
+    const groups = new Map();
+    for (const input of all('input[type="radio"]', root)) {
+      if (!writable(input) || (!visible(input) && !visible(input.labels?.[0])) ||
+          input.closest('.video-js, [class*="video-skin--"], [class*="audio--aplayer"]')) continue;
+      const container = input.closest('ul, fieldset, [role="radiogroup"]');
+      const key = container ?? input.name;
+      if (!key) continue;
+      const group = groups.get(key);
+      if (group) group.inputs.push(input);
+      else groups.set(key, { container, inputs: [input] });
+    }
+    return [...groups.values()];
+  }
+
+  function fillMoralEducationQuiz(root, questions, signal) {
+    const groups = quizRadioGroups(root);
+    const completed = new Set();
+    let recognized = false;
+    let pending = false;
+    for (const { container, inputs } of groups) {
+      if (signal.aborted || pageBlocked()) break;
+      const questionText = normalize(text(container?.parentElement));
+      const labels = inputs.map(input => normalize(choiceLabel(input)));
+      const match = questions.find(rule => {
+        const [prompt, answer, alternate] = rule;
+        return !completed.has(rule) && labels.some(label => answer.test(label)) &&
+          (prompt.test(questionText) || labels.some(label => alternate.test(label)));
+      });
+      if (!match) {
+        if (!inputs.some(input => input.checked)) pending = true;
+        continue;
+      }
+      recognized = true;
+      const answers = inputs.filter((_, index) => match[1].test(labels[index]));
+      const [answer] = answers;
+      if (answers.length !== 1 || inputs.some(input => input !== answer && input.checked)) {
+        pending = true;
+        continue;
+      }
+      if (!answer.checked) answer.click();
+      if (answer.isConnected && answer.checked) completed.add(match);
+      else pending = true;
+    }
+    return {
+      total: groups.length,
+      verified: !pending && completed.size === questions.length,
+      noReference: !recognized,
+      missingQuizAnswers: completed.size > 0 && (pending || completed.size < questions.length),
+    };
   }
 
   function pickCount(inputs, context) {
@@ -575,6 +631,9 @@
 
   function hasBlankControls(root) {
     if (!root) return false;
+    if (moralEducationQuizzes.some(([title]) => title.test(activeSection()?.title))) {
+      return quizRadioGroups(root).some(({ inputs }) => inputs.every(input => !input.checked));
+    }
     return shown(textInputSelector, root).some(el => writable(el) && !el.value.trim()) ||
       choiceGroups(root).some(group => group.every(el => !el.checked)) ||
       editableSelects(root).some(el => !el.value && [...el.options].some(option => option.value && !option.disabled)) ||
@@ -582,6 +641,9 @@
   }
 
   async function fillPage(root, signal, sequencePlans, rememberSequence, interrupted) {
+    const section = activeSection()?.title;
+    const quiz = moralEducationQuizzes.find(([title]) => title.test(section));
+    if (quiz) return fillMoralEducationQuiz(root, quiz[1], signal);
     const context = text(root);
     const choice = choiceGroups(root);
     const fields = shown(textInputSelector, root).filter(writable);
@@ -592,7 +654,6 @@
       .some(el => writable(el) && !usedInputs.has(el) &&
         !el.closest('.video-js, [class*="audio--aplayer"], table[class*="sequence-table"]'));
     const total = choice.length + fields.length + tables.length + selects.length;
-    const section = activeSection()?.title;
     const prompt = normalize(context);
     const presenting = presentingTitle.test(section);
     const interviewChoices = presenting && /listen to the interview again and check the ones you hear/.test(prompt) &&
@@ -601,16 +662,13 @@
     const interviewBlanks = fields.length === interviewAnswers.length && total === fields.length && interviewPrompt.test(prompt);
     const profileWriting = presenting && profilePrompt.test(prompt) && total === profileNotes.length &&
       fields.length === profileNotes.length && fields.every(input => input.tagName === 'TEXTAREA');
-    const quiz = moralEducationQuizzes.find(([title]) => title.test(section));
-    if ((presenting && !interviewChoices && !interviewBlanks && !profileWriting) ||
-        (quiz && (!quiz[1].test(prompt) || !choice.length || total !== choice.length))) {
+    if (presenting && !interviewChoices && !interviewBlanks && !profileWriting) {
       return { total, verified: false, noReference: true };
     }
     let guessed = 0;
     let examples = 0;
     let unmatchedWriting = false;
     let noReference = false;
-    let missingQuizAnswers = false;
     let verified = !unknown;
     const step = Number(stepLabel().split('/')[0]) || 1;
     const partTwo = rolePlayingTitle.test(section) &&
@@ -618,16 +676,12 @@
 
     for (const [index, inputs] of choice.entries()) {
       if (signal.aborted || pageBlocked()) return { total, guessed, verified: false };
-      const reference = partTwo ? rolePlayingExpressions : interviewChoices ? writerInterviewExpressions[index] : quiz?.[2][index];
-      if (quiz && !reference) {
-        if (!inputs.some(input => input.checked)) { verified = false; missingQuizAnswers = true; }
-        continue;
-      }
+      const reference = partTwo ? rolePlayingExpressions : interviewChoices ? writerInterviewExpressions[index] : null;
       if (!reference && inputs.some(input => input.checked)) continue;
       const hints = reference ?? audioChoices[answerLeaf()]?.[step - 1 + index] ?? [];
-      const count = quiz ? 1 : reference?.length ?? pickCount(inputs, context);
+      const count = reference?.length ?? pickCount(inputs, context);
       const result = choiceIndexes(inputs.map(choiceLabel), hints, count);
-      if (reference && (result.guessed || inputs.some(input => input.type !== (quiz ? 'radio' : 'checkbox')) ||
+      if (reference && (result.guessed || inputs.some(input => input.type !== 'checkbox') ||
           inputs.some((input, index) => input.checked && !result.indexes.includes(index)))) {
         if (result.guessed) noReference = true;
         verified = false;
@@ -685,7 +739,7 @@
       verified = result.verified && verified;
       guessed += result.guessed;
     }
-    return { total, guessed, examples, unmatchedWriting, verified, noReference, missingQuizAnswers, profileWriting };
+    return { total, guessed, examples, unmatchedWriting, verified, noReference, profileWriting };
   }
 
   async function processLeaf(signal) {
@@ -972,7 +1026,7 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.13';
+    panel.dataset.version = '0.1.14';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
