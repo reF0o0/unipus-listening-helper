@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.0
+// @version      0.1.1
 // @description  自动填写、提交并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -19,6 +19,7 @@
   const submitBar = '[class*="submit-bar-pc--container"]';
   const storageKey = 'local.u-campus.listening.1063529.v1';
   const transcriptUrl = 'https://news.culr.edu.cn/wyx/docs/2017-03/20170326101926785482.pdf';
+  const scoreReceipt = /本次共完成\s*\d+\s*道题[，,]\s*平均分为\s*\d+/;
 
   // Unit 1 answers checked against the public course transcript, then keyed by visible text.
   const carlosOrder = [
@@ -109,8 +110,10 @@
 
   function receiptState({ pageClass = '', info = '', modal = '', hasSubmit = false }) {
     const statusText = [info, modal].join(' ').trim();
+    if (/还有\s*\d+\s*道题没有作答/.test(statusText)) return 'incomplete';
     if (/尚未提交|仍未提交|提交未受理|本次答案未提交/.test(statusText)) return 'rejected';
-    if (/(?:已经|成功)提交|提交成功|^已提交(?:$|[：:\s])|已完成作答/.test(statusText)) return 'confirmed';
+    if (scoreReceipt.test(modal) ||
+        /(?:已经|成功)提交|提交成功|^已提交(?:$|[：:\s])|已完成作答/.test(statusText)) return 'confirmed';
     if (pageClass.split(/\s+/).some(name => /^(?:compelet(?:ed)?|complet(?:e|ed)|yiwancheng)$/i.test(name))) {
       return 'already';
     }
@@ -280,12 +283,18 @@
   }
 
   function writeText(el, value) {
+    el.focus({ preventScroll: true });
+    if (el.ownerDocument.activeElement !== el) return false;
     const prototype = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
     if (!setter) return false;
-    setter.call(el, value);
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
+    if (el.value !== value) {
+      setter.call(el, value);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    // FillBlankInput keeps edits locally until its blur handler commits them.
+    el.blur();
     return el.isConnected && el.value === value;
   }
 
@@ -332,6 +341,8 @@
       bubbles: true, cancelable: true, dataTransfer, clientX, clientY,
     }));
     send(source, 'dragstart', sourceBox.left + sourceBox.width / 2, sourceBox.top + sourceBox.height / 2);
+    // The course player initializes its drag preview on the source's drag event.
+    send(source, 'drag');
     send(target, 'dragenter');
     send(target, 'dragover');
     await delay(40);
@@ -339,17 +350,22 @@
     if (source.isConnected) send(source, 'dragend');
   }
 
-  async function fillSequence(table, context, signal) {
+  async function fillSequence(table, context, signal, remembered, remember, interrupted) {
     const cards = readCards(table);
     if (cards.length < 2) return { verified: false, guessed: 0 };
     const captions = cards.map(card => normalize(text(card.querySelector('[class*="caption-item"]'))));
-    if (captions.every(label => /^[a-z]$/.test(label)) && captions.join('') !== [...captions].sort().join('')) {
+    if (!remembered && !interrupted && captions.every(label => /^[a-z]$/.test(label)) &&
+        captions.join('') !== [...captions].sort().join('')) {
       return { verified: true, guessed: 0 };
     }
     const fixed = cards.flatMap((card, index) => card.draggable ? [] : [index]);
-    const planned = sequenceAnswer(cards.map(cardText), context, fixed);
-    if (!fixed.length && !cards.every(card => cardText(card))) return { verified: false, guessed: 0 };
-    if (new Set(planned.order).size < planned.order.length) return { verified: false, guessed: 0 };
+    const labels = cards.map(cardText);
+    if (labels.some(label => !label) || new Set(labels).size !== labels.length) return { verified: false, guessed: 0 };
+    const hasSameCards = remembered?.order?.length === labels.length &&
+      labels.every(label => remembered.order.includes(label)) &&
+      fixed.every(index => labels[index] === remembered.order[index]);
+    const planned = hasSameCards ? remembered : sequenceAnswer(labels, context, fixed);
+    remember(planned);
     for (let index = 0; index < planned.order.length; index++) {
       if (signal.aborted) return { verified: false, guessed: 0 };
       const current = readCards(table);
@@ -373,7 +389,7 @@
     return Boolean(root && shown('video,[class*="audio--aplayer"]', root).length);
   }
 
-  async function fillPage(root, signal) {
+  async function fillPage(root, signal, sequencePlans, rememberSequence, interrupted) {
     const context = text(root);
     const choice = choiceGroups(root);
     const fields = shown('input[class*="fill-blank--"],textarea.scoopFill_textarea', root)
@@ -401,8 +417,12 @@
 
     for (const [index, input] of fields.entries()) {
       if (signal.aborted) return { total, guessed, verified: false };
-      if (input.value.trim()) continue;
-      const nearby = input.parentElement?.previousSibling?.textContent ?? context;
+      if (input.value.trim()) {
+        verified = writeText(input, input.value) && verified;
+        continue;
+      }
+      const nearby = input.previousSibling?.textContent ??
+        input.parentElement?.previousSibling?.textContent ?? context;
       let result = fieldAnswer(context, nearby, index, fields.length);
       if (/write down its general idea/.test(normalize(context)) && answerLeaf() === 'u1g6') {
         result = { text: 'Hina asks people about their social lives and what they did the night before.', guessed: false };
@@ -425,8 +445,9 @@
       guessed++;
     }
 
-    for (const table of tables) {
-      const result = await fillSequence(table, context, signal);
+    for (const [index, table] of tables.entries()) {
+      const result = await fillSequence(table, context, signal, sequencePlans[index],
+        plan => rememberSequence(index, plan), interrupted);
       verified = result.verified && verified;
       guessed += result.guessed;
     }
@@ -439,7 +460,7 @@
       if (baseHash() !== key) return false;
       const result = inspectReceipt();
       if (result !== 'unknown') return result;
-      if (!justClicked || actedOnDialog) return false;
+      if (actedOnDialog) return false;
       const dialog = visibleDialogs().reverse().find(node =>
         /(?:确认|确定|是否|继续).{0,14}提交|提交.{0,14}(?:确认|确定)/.test(text(node)));
       const confirm = dialog && shown('button', dialog).find(el =>
@@ -453,9 +474,9 @@
   }
 
   function closeReceipt() {
-    const dialog = visibleDialogs().reverse().find(el =>
+    const dialog = visibleDialogs().reverse().find(el => scoreReceipt.test(text(el)) ||
       /提交成功|已完成作答|尚未提交|仍未提交|本次答案未提交/.test(text(el)));
-    const ok = dialog && shown('button', dialog).find(el => text(el) === '确定');
+    const ok = dialog && shown('button', dialog).find(el => /^(?:确定|查看答案)$/.test(text(el)));
     if (ok) ok.click();
   }
 
@@ -478,7 +499,13 @@
       const root = pageRoot();
       if (record.state !== 'pending') {
         if (!listeningPage(root)) return 'outside';
-        const result = await fillPage(root, signal);
+        const stepName = stepLabel();
+        const sequencePlans = { ...record.sequencePlans?.[stepName] };
+        const interrupted = record.state === 'failed' && answerLeaf() === 'u1g26';
+        const result = await fillPage(root, signal, sequencePlans, (index, plan) => {
+          sequencePlans[index] = plan;
+          save({ state: 'progress', sequencePlans: { ...record.sequencePlans, [stepName]: sequencePlans } });
+        }, interrupted);
         if (signal.aborted) return 'stopped';
         if (!result.total || !result.verified) {
           save({ state: 'failed', message: result.total ? '题目控件未能读回所填答案' : '未发现可填写的听力题控件' });
@@ -501,6 +528,13 @@
           waitForReceipt: decision => waitForReceipt(key, signal, ['submit', 'retry'].includes(decision)),
         });
         let outcome = await runner.finish(key, previous);
+        if (!signal.aborted && baseHash() === key && inspectReceipt() === 'incomplete') {
+          const dialog = visibleDialogs().reverse().find(el => /还有\s*\d+\s*道题没有作答/.test(text(el)));
+          const back = dialog && shown('button', dialog).find(el => /^(?:取消|返回修改)$/.test(text(el)));
+          back?.click();
+          save({ state: 'failed', message: '平台仍提示存在未作答题目' });
+          return 'failed';
+        }
         if (!signal.aborted && baseHash() === key && decideSubmit(outcome, inspectReceipt()) === 'retry') {
           closeReceipt();
           // The rejection has already been read; keep the result for this single retry.
@@ -647,6 +681,7 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
+    panel.dataset.version = '0.1.1';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
