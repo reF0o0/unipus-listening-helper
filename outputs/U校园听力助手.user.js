@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.9
+// @version      0.1.10
 // @description  自动填写并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -15,6 +15,7 @@
   const courseRoute = /^#\/course-v1:Unipus\+nhce_3_vls_1_sz\+2021_08\/courseware\/u([1-8])\//;
   const sectionTitle = /^[1-8]-(?:2 Sharing|3 Listening|4 Viewing|8 More practice in listening)$/i;
   const rolePlayingTitle = /^1-6 Role-playing$/i;
+  const rolePlayingLessons = new Set(['note them down', 'role play it']);
   const supportedSection = title => sectionTitle.test(title) || rolePlayingTitle.test(title);
   const lectureTabs = '#header ul.TabsBox a.topTab';
   const numberedTabs = '#header [class*="circleTabsBox"] a';
@@ -200,7 +201,7 @@
     return section && supportedSection(section.title) ? section : undefined;
   };
   const activeLesson = () => all(lectureTabs).find(el => el.closest('li')?.classList.contains('active'));
-  const noteThemDown = () => normalize(text(activeLesson())) === 'note them down';
+  const supportedRolePlayingLesson = () => rolePlayingLessons.has(normalize(text(activeLesson())));
   const activeCircle = () => document.querySelector(numberedTabs + '.selected');
   const sectionLinks = () => all('li.courseware a[title]').filter(el => supportedSection(el.title));
   const stepLabel = () => text(document.querySelector('#pageLayout [class*="pclayout--step-"]')) || '1/1';
@@ -649,12 +650,15 @@
     for (let step = 0; step < 40 && !signal.aborted; step++) {
       if (baseHash() !== key || !sameCourse()) return 'moved';
       const root = pageRoot();
-      if (root && (shown('[class*="sentencesToRead--record-wrap"]', root).length ||
-          /Repeat and learn to use them|To start recording, click/i.test(text(root)))) {
-        save({ state: 'recording', message: '待录音，请在课程页使用麦克风完成跟读' });
+      if (!root) return 'outside';
+      const prompt = text(root);
+      const chooseRole = /To start recording,\s*select a role/i.test(prompt);
+      if (chooseRole || /Repeat and learn to use them|To start recording,\s*click/i.test(prompt) ||
+          shown('[class*="sentencesToRead--record-wrap"]', root).length) {
+        save({ state: 'recording', message: chooseRole ? '待录音，请在课程页选择角色并用麦克风录音' :
+          '待录音，请在课程页使用麦克风完成跟读' });
         return 'recording';
       }
-      if (!root) return 'outside';
       const stepName = stepLabel();
       const sequencePlans = { ...record.sequencePlans?.[stepName] };
       const interrupted = record.state === 'failed' && answerLeaf() === 'u1g26';
@@ -723,7 +727,7 @@
     const isRolePlaying = rolePlayingTitle.test(title);
     for (let leaf = 0; leaf < 32 && !signal.aborted; leaf++) {
       if (activeSection()?.title !== title || (currentUnit && unitOfHash(location.hash) !== currentUnit)) return false;
-      if (isRolePlaying && !noteThemDown()) return true;
+      if (isRolePlaying && !supportedRolePlayingLesson()) return true;
       summarize('运行中：' + taskLabel());
       const before = baseHash();
       const result = await processLeaf(signal);
@@ -746,7 +750,7 @@
     if (mode === 'sample') {
       const section = activeSection();
       if (!section) return '请打开一页支持填写的教材听力练习';
-      if (rolePlayingTitle.test(section.title) && !noteThemDown()) return '1-6 仅支持 Note them down 的两页听力练习';
+      if (rolePlayingTitle.test(section.title) && !supportedRolePlayingLesson()) return '当前标签页没有支持填写的练习';
       const result = await processLeaf(signal);
       if (result === 'confirmed') return '本页已有完成记录';
       if (result === 'draft') return '本页已填写';
@@ -904,7 +908,7 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.9';
+    panel.dataset.version = '0.1.10';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
