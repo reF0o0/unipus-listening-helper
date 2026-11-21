@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.4
-// @description  自动填写、提交并切换本课程的教材听力练习
+// @version      0.1.5
+// @description  自动填写并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
 // @grant        none
@@ -126,40 +126,6 @@
     return 'unknown';
   }
 
-  function decideSubmit(record, receipt) {
-    if (receipt === 'rate-limited') return 'hold';
-    if (record?.state === 'confirmed' || ['confirmed', 'already'].includes(receipt)) return 'finish';
-    if (record?.state !== 'pending') return 'submit';
-    if (receipt !== 'rejected') return 'observe';
-    return record.attempts < 2 ? 'retry' : 'hold';
-  }
-
-  class ExerciseAutomation {
-    constructor({ inspectReceipt, persist, submit, waitForReceipt }) {
-      Object.assign(this, { inspectReceipt, persist, submit, waitForReceipt });
-    }
-
-    async finish(key, record = this.record) {
-      const receipt = this.inspectReceipt();
-      const decision = decideSubmit(record, receipt);
-      const save = next => {
-        this.record = next;
-        this.persist(next, key);
-        return next;
-      };
-      if (decision === 'finish') return save({ ...record, state: 'confirmed' });
-      if (decision === 'hold') return record;
-      if (decision === 'submit' || decision === 'retry') {
-        record = save({ ...record, state: 'pending', attempts: (record?.attempts ?? 0) + 1 });
-        this.submit();
-      }
-      const outcome = await this.waitForReceipt(decision);
-      return ['already', 'confirmed'].includes(outcome)
-        ? save({ ...record, state: 'confirmed' })
-        : record;
-    }
-  }
-
   function visible(el) {
     return Boolean(el?.isConnected && el.getClientRects().length &&
       !el.closest('[hidden],[aria-hidden="true"]'));
@@ -168,7 +134,7 @@
   if (typeof module === 'object' && module.exports) {
     module.exports = {
       normalize, isCourse, sequenceAnswer, fieldAnswer, choiceIndexes,
-      receiptState, decideSubmit, ExerciseAutomation, visible,
+      receiptState, visible,
     };
     return;
   }
@@ -202,10 +168,12 @@
   let resumeTimer;
 
   function load() {
-    const defaults = { auto: false, section: '', unitSections: {}, visits: {}, records: {} };
+    const defaults = { fillOnly: true, auto: false, section: '', unitSections: {}, visits: {}, records: {} };
     try {
       const cached = JSON.parse(localStorage.getItem(storageKey) ?? '{}');
-      return { ...defaults, ...cached };
+      if (cached.fillOnly) return { ...defaults, ...cached };
+      return { ...defaults, ...cached, fillOnly: true, auto: false, section: '',
+        unitSections: {}, visits: {} };
     } catch {
       return defaults;
     }
@@ -269,6 +237,7 @@
       return totals;
     }, { guessed: 0 });
     panelMessage.textContent = prefix + ' | 已确认 ' + (counts.confirmed ?? 0) +
+      ' · 已填写 ' + (counts.draft ?? 0) +
       ' · 猜填 ' + counts.guessed + ' · 待确认 ' + (counts.pending ?? 0) +
       ' · 未完成 ' + (counts.failed ?? 0) +
       ' · 待录音 ' + (counts.recording ?? 0) +
@@ -348,6 +317,17 @@
     controller.abort(ratePauseMessage);
   }
 
+  function pageBlocked() {
+    if (controller.signal.aborted) return true;
+    if (rateLimitDialog()) {
+      pauseForRateLimit();
+      return true;
+    }
+    if (!visibleDialogs().length) return false;
+    controller.abort('平台有提示需要处理，已停在原页');
+    return true;
+  }
+
   async function until(predicate, timeout = 12000, signal = controller?.signal) {
     const end = Date.now() + timeout;
     do {
@@ -364,6 +344,7 @@
     let since = 0;
     return until(() => {
       if (dismissStudyNotice(true)) return false;
+      if (pageBlocked()) return false;
       const root = pageRoot();
       if (!visible(root) || /\/__main$/.test(location.hash)) return false;
       const snapshot = location.hash + '|' + stepLabel() + '|' + root.childElementCount + '|' + text(root).slice(0, 100);
@@ -376,10 +357,13 @@
   }
 
   async function navigate(control, signal, readTarget = () => location.hash + '|' + stepLabel()) {
-    if (!visible(control) || signal.aborted) return false;
+    if (!visible(control) || control.disabled || control.closest('[aria-disabled="true"]') || signal.aborted || pageBlocked()) return false;
     const before = readTarget();
     control.click();
-    return Boolean(await until(() => readTarget() !== before, 7500, signal) && await stablePage(signal));
+    return Boolean(await until(() => {
+      if (dismissStudyNotice(true) || pageBlocked()) return false;
+      return readTarget() !== before;
+    }, 7500, signal) && await stablePage(signal));
   }
 
   function writeText(el, value) {
@@ -467,7 +451,7 @@
     const planned = hasSameCards ? remembered : sequenceAnswer(labels, context, fixed);
     remember(planned);
     for (let index = 0; index < planned.order.length; index++) {
-      if (signal.aborted) return { verified: false, guessed: 0 };
+      if (signal.aborted || pageBlocked()) return { verified: false, guessed: 0 };
       const current = readCards(table);
       const from = current.findIndex(card => cardText(card) === planned.order[index]);
       if (from === index) continue;
@@ -506,7 +490,7 @@
     const step = Number(stepLabel().split('/')[0]) || 1;
 
     for (const [index, inputs] of choice.entries()) {
-      if (signal.aborted) return { total, guessed, verified: false };
+      if (signal.aborted || pageBlocked()) return { total, guessed, verified: false };
       if (inputs.some(input => input.checked)) continue;
       const hints = audioChoices[answerLeaf()]?.[step - 1 + index] ?? [];
       const result = choiceIndexes(inputs.map(choiceLabel), hints, pickCount(inputs, context));
@@ -516,7 +500,7 @@
     }
 
     for (const [index, input] of fields.entries()) {
-      if (signal.aborted) return { total, guessed, verified: false };
+      if (signal.aborted || pageBlocked()) return { total, guessed, verified: false };
       if (input.value.trim()) {
         verified = writeText(input, input.value) && verified;
         continue;
@@ -533,7 +517,7 @@
 
     const used = new Set(selects.filter(el => el.value).map(el => el.value));
     for (const select of selects) {
-      if (signal.aborted) return { total, guessed, verified: false };
+      if (signal.aborted || pageBlocked()) return { total, guessed, verified: false };
       if (select.value) continue;
       const options = [...select.options].filter(option => !option.disabled && option.value);
       const option = shuffled(options.filter(item => !used.has(item.value)))[0];
@@ -554,32 +538,6 @@
     return { total, guessed, verified };
   }
 
-  async function waitForReceipt(key, signal, justClicked) {
-    let actedOnDialog = false;
-    return await until(() => {
-      if (baseHash() !== key) return false;
-      const result = inspectReceipt();
-      if (result !== 'unknown') return result;
-      if (actedOnDialog) return false;
-      const dialog = visibleDialogs().reverse().find(node =>
-        /(?:确认|确定|是否|继续).{0,14}提交|提交.{0,14}(?:确认|确定)/.test(text(node)));
-      const confirm = dialog && shown('button', dialog).find(el =>
-        /^(?:提交|确定|确认|继续提交)$/.test(text(el)) && !el.disabled);
-      if (confirm) {
-        actedOnDialog = true;
-        confirm.click();
-      }
-      return false;
-    }, justClicked ? 22000 : 4000, signal) || 'unknown';
-  }
-
-  function closeReceipt() {
-    const dialog = visibleDialogs().reverse().find(el => scoreReceipt.test(text(el)) ||
-      /提交成功|已完成作答|尚未提交|仍未提交|本次答案未提交/.test(text(el)));
-    const ok = dialog && shown('button', dialog).find(el => /^(?:确定|查看答案)$/.test(text(el)));
-    if (ok) ok.click();
-  }
-
   async function processLeaf(signal) {
     const key = baseHash();
     const label = taskLabel();
@@ -588,13 +546,9 @@
       record = { ...record, ...update, label };
       saveRecord(key, record);
     };
-    const receipt = inspectReceipt();
-    if (receipt === 'rate-limited') {
-      pauseForRateLimit();
-      return 'rate-limited';
-    }
+    if (pageBlocked()) return 'stopped';
     if (record.state === 'confirmed') return 'confirmed';
-    if (['confirmed', 'already'].includes(receipt)) {
+    if (['confirmed', 'already'].includes(inspectReceipt())) {
       save({ state: 'confirmed', message: '平台已确认' });
       return 'confirmed';
     }
@@ -607,67 +561,35 @@
         save({ state: 'recording', message: '待录音，请在课程页使用麦克风完成跟读' });
         return 'recording';
       }
-      if (record.state !== 'pending') {
-        if (!listeningPage(root)) return 'outside';
-        const stepName = stepLabel();
-        const sequencePlans = { ...record.sequencePlans?.[stepName] };
-        const interrupted = record.state === 'failed' && answerLeaf() === 'u1g26';
-        const result = await fillPage(root, signal, sequencePlans, (index, plan) => {
-          sequencePlans[index] = plan;
-          save({ state: 'progress', sequencePlans: { ...record.sequencePlans, [stepName]: sequencePlans } });
-        }, interrupted);
+      if (!listeningPage(root)) return 'outside';
+      const stepName = stepLabel();
+      const sequencePlans = { ...record.sequencePlans?.[stepName] };
+      const interrupted = record.state === 'failed' && answerLeaf() === 'u1g26';
+      const result = await fillPage(root, signal, sequencePlans, (index, plan) => {
+        sequencePlans[index] = plan;
+        save({ state: 'progress', sequencePlans: { ...record.sequencePlans, [stepName]: sequencePlans } });
+      }, interrupted);
+      if (signal.aborted || pageBlocked()) return 'stopped';
+      if (baseHash() !== key) return 'moved';
+      const next = button('下一题');
+      if (!result.total && result.verified && !button('提交') && !next) {
+        save({ state: 'reference', message: '本页没有可填写的练习' });
+        return 'outside';
+      }
+      if (!result.total || !result.verified) {
+        save({ state: 'failed', message: result.total ? '题目控件未能读回所填答案' : '未发现可填写的听力题控件' });
+        return 'failed';
+      }
+      const stepNotes = { ...record.stepNotes, [stepName]: result.guessed || record.stepNotes?.[stepName] || 0 };
+      save({
+        state: next ? 'progress' : 'draft',
+        stepNotes,
+        guessed: Object.values(stepNotes).reduce((a, b) => a + b, 0),
+        message: next ? '正在填写' : '已填写，提交状态以平台为准',
+      });
+      if (!next) return 'draft';
+      if (!await navigate(next, signal)) {
         if (signal.aborted) return 'stopped';
-        if (!result.total && result.verified && !button('提交') && !button('下一题')) {
-          save({ state: 'reference', message: '本页没有可填写的练习' });
-          return 'outside';
-        }
-        if (!result.total || !result.verified) {
-          save({ state: 'failed', message: result.total ? '题目控件未能读回所填答案' : '未发现可填写的听力题控件' });
-          return 'failed';
-        }
-        const stepNotes = { ...record.stepNotes, [stepLabel()]: result.guessed || record.stepNotes?.[stepLabel()] || 0 };
-        save({ state: 'progress', stepNotes, guessed: Object.values(stepNotes).reduce((a, b) => a + b, 0) });
-      }
-
-      if (record.state === 'pending' || button('提交')) {
-        const previous = record;
-        const runner = new ExerciseAutomation({
-          inspectReceipt,
-          persist: update => save({ ...update, message: update.state === 'confirmed' ? '平台已确认' : '等待平台提交回执' }),
-          submit: () => {
-            if (signal.aborted || baseHash() !== key) return;
-            if (inspectReceipt() === 'rejected') closeReceipt();
-            button('提交')?.click();
-          },
-          waitForReceipt: decision => waitForReceipt(key, signal, ['submit', 'retry'].includes(decision)),
-        });
-        let outcome = await runner.finish(key, previous);
-        if (!signal.aborted && baseHash() === key && inspectReceipt() === 'rate-limited') {
-          pauseForRateLimit();
-          return 'rate-limited';
-        }
-        if (!signal.aborted && baseHash() === key && inspectReceipt() === 'incomplete') {
-          const dialog = visibleDialogs().reverse().find(el => /还有\s*\d+\s*道题没有作答/.test(text(el)));
-          const back = dialog && shown('button', dialog).find(el => /^(?:取消|返回修改)$/.test(text(el)));
-          back?.click();
-          save({ state: 'failed', message: '平台仍提示存在未作答题目' });
-          return 'failed';
-        }
-        if (!signal.aborted && baseHash() === key && decideSubmit(outcome, inspectReceipt()) === 'retry') {
-          closeReceipt();
-          // The rejection has already been read; keep the result for this single retry.
-          runner.inspectReceipt = () => 'rejected';
-          outcome = await runner.finish(key, outcome);
-          if (!signal.aborted && baseHash() === key && inspectReceipt() === 'rate-limited') {
-            pauseForRateLimit();
-            return 'rate-limited';
-          }
-        }
-        if (outcome?.state === 'confirmed') closeReceipt();
-        return outcome?.state ?? 'pending';
-      }
-
-      if (!await navigate(button('下一题'), signal)) {
         save({ state: 'failed', message: '未能进入本组下一题' });
         return 'failed';
       }
@@ -715,19 +637,6 @@
     return false;
   }
 
-  async function revisit(signal) {
-    for (const [key, record] of Object.entries(state.records)) {
-      if (signal.aborted) return;
-      if (record.state !== 'pending' || !record.hash || !courseRoute.test(record.hash)) continue;
-      if (currentUnit && unitOfHash(record.hash) !== currentUnit) continue;
-      if (baseHash() !== key) {
-        location.hash = record.hash;
-        if (!await until(() => baseHash() === key, 7000, signal) || !await stablePage(signal)) continue;
-      }
-      await processLeaf(signal);
-    }
-  }
-
   async function run(mode, signal) {
     if (currentUnit && unitOfHash(location.hash) !== currentUnit) return '请回到 Unit ' + currentUnit + ' 再继续';
     if (inspectReceipt() === 'rate-limited') {
@@ -738,10 +647,9 @@
     if (mode === 'sample') {
       if (!activeSection()) return '请打开一页教材听力练习验收';
       const result = await processLeaf(signal);
-      if (result !== 'confirmed') return '验收页：' + (state.records[baseHash()]?.message ?? '尚未确认');
-      const next = nextCircle() ?? nextLesson();
-      if (next && await navigate(next, signal)) return '验收通过：已提交并到下一页';
-      return next ? '验收页已提交，切页尚未确认' : '验收页已提交';
+      if (result === 'confirmed') return '本页已有完成记录';
+      if (result === 'draft') return '本页已填写';
+      return '本页：' + (state.records[baseHash()]?.message ?? '未发现可填写内容');
     }
 
     const sections = [...new Set(sectionLinks().map(link => link.title))]
@@ -751,7 +659,6 @@
     const index = Math.max(0, sections.indexOf(cursor));
     for (const title of sections.slice(index)) {
       if (signal.aborted) return '已停止';
-      if (state.visits[title] === 'finished') continue;
       setSectionCursor(title);
       persist();
       const done = await runSection(title, signal);
@@ -759,7 +666,6 @@
       state.visits[title] = done ? 'finished' : 'unreached';
       persist();
     }
-    if (!signal.aborted) await revisit(signal);
     if (!signal.aborted) {
       setSectionCursor('');
       persist();
@@ -829,7 +735,8 @@
           state.auto = false;
           persist();
         }
-        summarize(signal.reason === ratePauseMessage ? cooldownStatus() : message);
+        summarize(signal.reason === ratePauseMessage ? cooldownStatus() :
+          typeof signal.reason === 'string' ? signal.reason : signal.aborted ? '已停止' : message);
       });
     } catch (error) {
       console.warn('[U校园听力助手]', error);
@@ -850,7 +757,7 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.4';
+    panel.dataset.version = '0.1.5';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
@@ -866,9 +773,9 @@
       return el;
     };
     buttons = {
-      sample: makeButton('验收本页', () => start('sample')),
-      unit: makeButton('只跑本单元', () => start('unit')),
-      start: makeButton('开始全自动', () => start('all')),
+      sample: makeButton('填写本页', () => start('sample')),
+      unit: makeButton('只填本单元', () => start('unit')),
+      start: makeButton('全课只填写', () => start('all')),
       stop: makeButton('停止', () => {
         if (!controller) state = load();
         controller?.abort();
