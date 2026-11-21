@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.2
+// @version      0.1.3
 // @description  自动填写、提交并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -20,6 +20,7 @@
   const storageKey = 'local.u-campus.listening.1063529.v1';
   const transcriptUrl = 'https://news.culr.edu.cn/wyx/docs/2017-03/20170326101926785482.pdf';
   const scoreReceipt = /本次共完成\s*\d+\s*道题[，,]\s*平均分为\s*\d+/;
+  const rateNotice = /操作(?:过于|太)频繁|请休息几分钟后再继续学习/;
 
   // Unit 1 answers checked against the public course transcript, then keyed by visible text.
   const carlosOrder = [
@@ -110,7 +111,7 @@
 
   function receiptState({ pageClass = '', info = '', modal = '', hasSubmit = false }) {
     const statusText = [info, modal].join(' ').trim();
-    if (/操作(?:过于|太)频繁|请休息几分钟后再继续学习/.test(statusText)) return 'rate-limited';
+    if (rateNotice.test(statusText)) return 'rate-limited';
     if (/还有\s*\d+\s*道题没有作答/.test(statusText)) return 'incomplete';
     if (/尚未提交|仍未提交|提交未受理|本次答案未提交/.test(statusText)) return 'rejected';
     if (scoreReceipt.test(modal) ||
@@ -191,6 +192,7 @@
   let state;
   let panelMessage;
   let buttons;
+  let resumeTimer;
 
   function load() {
     try {
@@ -258,7 +260,27 @@
     });
   }
 
-  const ratePauseMessage = '平台限频，已暂停；请等待后手动继续';
+  const ratePauseMessage = '平台限频，已暂停';
+  const rateLimitDialog = () => visibleDialogs().reverse().find(node => rateNotice.test(text(node)));
+
+  function cooldownStatus() {
+    if (state.resumePlan) {
+      if (location.hash !== state.resumePlan.hash) return '平台限频，返回原页后可自动继续';
+      return '平台限频，等待结束后自动继续一次';
+    }
+    return state.rateRecoveryUsed ? '平台再次限频，已停止自动继续' : ratePauseMessage;
+  }
+
+  function scheduleResume() {
+    clearTimeout(resumeTimer);
+    if (controller) return;
+    const plan = state.resumePlan;
+    buttons.stop.disabled = !plan;
+    if (!plan || location.hash !== plan.hash) return;
+    resumeTimer = setTimeout(() => {
+      if (panelMessage.isConnected) void start(plan.mode, plan);
+    }, Math.max(0, plan.after - Date.now()));
+  }
 
   function pauseForRateLimit() {
     const key = baseHash();
@@ -270,8 +292,11 @@
     }
     state.auto = false;
     state.resumeAfter = Date.now() + 5 * 60 * 1000;
+    state.resumePlan = state.rateRecoveryUsed ? null : {
+      hash: location.hash, mode: currentMode, after: state.resumeAfter,
+    };
     if (previous?.state === 'confirmed') persist();
-    else saveRecord(key, { label: taskLabel(), state: 'rate-limited', message: ratePauseMessage });
+    else saveRecord(key, { label: taskLabel(), state: 'rate-limited', message: cooldownStatus() });
     controller.abort(ratePauseMessage);
   }
 
@@ -691,37 +716,55 @@
     return signal.aborted ? '已停止' : unreachable ? '本轮结束，未走完小节 ' + unreachable : '教材听力目录已遍历';
   }
 
-  async function start(mode) {
+  async function start(mode, scheduledPlan = null, reopening = false) {
     if (controller) return;
     if (!navigator.locks) { summarize('此浏览器无法锁定课程运行'); return; }
+    clearTimeout(resumeTimer);
     controller = new AbortController();
     currentMode = mode;
     const { signal } = controller;
     buttons.sample.disabled = true;
     buttons.start.disabled = true;
     buttons.stop.disabled = false;
+    let reschedule = true;
     try {
       await navigator.locks.request(storageKey, { ifAvailable: true }, async lock => {
         state = load();
         if (!lock || signal.aborted) {
+          reschedule = false;
           summarize(lock ? '已停止' : '另一个标签页正在处理本课程');
           return;
         }
         if (state.resumeAfter > Date.now()) {
-          summarize('平台限频，约 ' + Math.ceil((state.resumeAfter - Date.now()) / 60000) + ' 分钟后可手动继续');
+          summarize(cooldownStatus());
           return;
         }
+        if (scheduledPlan && (state.resumePlan?.hash !== scheduledPlan.hash ||
+            state.resumePlan.after !== scheduledPlan.after || state.resumePlan.mode !== mode ||
+            location.hash !== scheduledPlan.hash || !sameCourse())) {
+          return;
+        }
+        state.resumePlan = null;
+        if (!reopening) state.rateRecoveryUsed = Boolean(scheduledPlan);
         state.auto = mode === 'all';
         persist();
         summarize('正在准备');
         let message;
         try {
-          message = await run(mode, signal);
+          const dialog = scheduledPlan && rateLimitDialog();
+          if (dialog) {
+            const ok = shown('button', dialog).find(el => text(el) === '确定' && !el.disabled);
+            ok?.click();
+            if (!ok || !await until(() => !rateLimitDialog(), 4000, signal)) {
+              message = '冷却结束，平台提示仍在，请检查原页';
+            }
+          }
+          if (!message) message = await run(mode, signal);
         } finally {
           state.auto = false;
           persist();
         }
-        summarize(signal.reason === ratePauseMessage ? ratePauseMessage : message);
+        summarize(signal.reason === ratePauseMessage ? cooldownStatus() : message);
       });
     } catch (error) {
       console.warn('[U校园听力助手]', error);
@@ -731,14 +774,15 @@
       currentMode = undefined;
       buttons.sample.disabled = false;
       buttons.start.disabled = false;
-      buttons.stop.disabled = true;
+      buttons.stop.disabled = !state.resumePlan;
+      if (reschedule) scheduleResume();
     }
   }
 
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.2';
+    panel.dataset.version = '0.1.3';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
@@ -757,11 +801,14 @@
       sample: makeButton('验收本页', () => start('sample')),
       start: makeButton('开始全自动', () => start('all')),
       stop: makeButton('停止', () => {
+        if (!controller) state = load();
         controller?.abort();
-        if (currentMode === 'all') {
-          state.auto = false;
-          persist();
-        }
+        clearTimeout(resumeTimer);
+        state.auto = false;
+        state.resumePlan = null;
+        persist();
+        buttons.stop.disabled = true;
+        summarize('已停止');
       }),
     };
     buttons.stop.disabled = true;
@@ -772,12 +819,18 @@
     panel.append(title, actions, panelMessage);
     document.body.append(panel);
     state = load();
-    summarize(state.resumeAfter > Date.now() ? ratePauseMessage : '就绪');
+    summarize(state.resumeAfter > Date.now() || state.resumePlan ? cooldownStatus() : '就绪');
     dismissStudyNotice();
     new MutationObserver(() => {
       if (panel.isConnected) dismissStudyNotice();
     }).observe(document.body, { childList: true, subtree: true });
-    if (state.auto && !(state.resumeAfter > Date.now())) void start('all');
+    window.addEventListener('hashchange', () => {
+      if (controller || !state.resumePlan) return;
+      summarize(cooldownStatus());
+      scheduleResume();
+    });
+    if (state.resumePlan) scheduleResume();
+    else if (state.auto && !(state.resumeAfter > Date.now())) void start('all', null, true);
   }
 
   mount();
