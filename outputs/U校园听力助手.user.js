@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.7
+// @version      0.1.8
 // @description  自动填写并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -28,7 +28,7 @@
     ['pending', '待确认'], ['failed', '未完成'], ['rate-limited', '限频'], ['recording', '待录音'],
   ]);
 
-  // Unit 1 answers checked against the public course transcript, then keyed by visible text.
+  // Answers checked against the public course transcript, then keyed by visible text.
   const carlosOrder = [
     'He was born and grew up in Havana.',
     'He often missed school.',
@@ -48,6 +48,21 @@
     [/part 1 of the conversation and fill in the blanks.*i went for a walk.*with my boyfriend diego.*by the river/,
       ['It was great', "He's a football player", 'It was really beautiful']],
     [/so many changes when a person comes to college.*(parents around|college life)/, ['programmes', 'very', 'decisions', 'doing laundry', 'Obviously', 'choices', 'ruining', 'get used to', 'opportunities', 'step back']],
+    // Units 2–8, Further practice in listening, Passage 2.
+    [/people joke that no one in los angeles reads.*book festival.*one of the festival founders/,
+      ['comic', 'traffic', 'constantly', 'available', 'took part in', 'attracted', 'audience', 'free of charge', 'put forward', 'embrace']],
+    [/some parts of the earth are more likely to have earthquakes.*yellowstone national park.*careful preparations/,
+      ['mountainous', 'frightened', 'took place', 'vanish', 'occurred', 'massive', 'caught in', 'keep us away from', 'grateful', 'in advance']],
+    [/humans first means of transportation were walking and swimming.*steam engine.*human beings are able to enjoy/,
+      ['Gradually', 'enabled', 'vehicles', 'dates back to', 'As a result', 'thoroughly', 'capacity', 'turn', 'automobiles', 'thanks to']],
+    [/most people like to keep a healthy diet.*holiday season.*emotional eating/,
+      ['celebrate', 'provide us with', 'sticking to', 'challenges', 'anticipating', 'portions', 'stuff', 'take hold of', 'effective', 'strategies']],
+    [/there are many factors that affect a person s sleep.*biological rhythms.*regular sleep patterns/,
+      ['pressures', 'disappear', 'compromise', 'alcohol', 'intense', 'interferes with', 'undermine', 'pay attention to', 'suffers from', 'competitive']],
+    [/anna was awarded a special day out.*nature park.*hatching season/,
+      ['participated in', 'access', 'tremendous', 'currently', 'incredible', 'accompany', 'remarkable', 'amazing', 'catching a glimpse of', 'looking forward to']],
+    [/happiness in life has more to do with respect and influence than wealth.*business schools.*level of happiness/,
+      ['evidence', 'enhance', 'interviewed', 'rated', 'took into account', 'forecast', 'emerged', 'was related to', 'adapt', 'original']],
   ];
   const rolePlayingExpressions = ['And you?', 'What did you do?', 'Really?', 'Where did you play?', "I don't believe you!"];
   const audioChoices = {
@@ -879,12 +894,12 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.7';
+    panel.dataset.version = '0.1.8';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
     title.textContent = 'U校园听力助手';
-    title.title = '拖动标题移动面板。Unit 1 已核对答案来源：' + transcriptUrl;
+    title.title = '拖动标题移动面板。已收录的录音题答案来源：' + transcriptUrl;
     title.style.cssText = 'display:block;cursor:grab;touch-action:none;user-select:none';
     const actions = document.createElement('div');
     const makeButton = (label, action) => {
