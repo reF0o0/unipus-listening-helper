@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.5
+// @version      0.1.6
 // @description  自动填写并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -21,6 +21,7 @@
   const transcriptUrl = 'https://news.culr.edu.cn/wyx/docs/2017-03/20170326101926785482.pdf';
   const scoreReceipt = /本次共完成\s*\d+\s*道题[，,]\s*平均分为\s*\d+/;
   const rateNotice = /操作(?:过于|太)频繁|请休息几分钟后再继续学习/;
+  const textInputSelector = 'input[class*="fill-blank--"],textarea.scoopFill_textarea,textarea[class*="writing--textarea"]';
   const attentionLabels = new Map([
     ['pending', '待确认'], ['failed', '未完成'], ['rate-limited', '限频'], ['recording', '待录音'],
   ]);
@@ -100,6 +101,34 @@
     return { text, guessed: true };
   }
 
+  function writtenAnswer(context, question, index, count) {
+    const prompt = normalize(context);
+    if (count === 1 && /someone in your family that you like most/.test(prompt) &&
+        /what you have learned/.test(prompt)) {
+      return {
+        text: 'Sample answer: I admire my mother because she is patient and hardworking. She listens to me when I have a problem and encourages me to keep trying. From her, I have learned to stay calm and be kind to others.',
+        example: true,
+      };
+    }
+    const carlosQuestions = [
+      [/who is carlos acosta/, 'He is a famous Cuban ballet dancer.'],
+      [/where is he from/, 'He is from Havana, Cuba.'],
+      [/what are the three things/, 'He talks about his home country, his family, and his childhood.'],
+    ];
+    if (count === 3 && carlosQuestions.every(([clue]) => clue.test(prompt))) {
+      const questionText = normalize(question);
+      const matched = carlosQuestions.filter(([clue]) => clue.test(questionText));
+      if (matched.length === 1) return { text: matched[0][1] };
+      const order = carlosQuestions.map(([clue]) => prompt.search(clue));
+      if (order[0] < order[1] && order[1] < order[2]) return { text: carlosQuestions[index][1] };
+    }
+    if (count === 1 && /do you go out a lot|what are we going to talk about/.test(prompt) &&
+        /write down its general idea/.test(prompt)) {
+      return { text: 'Hina asks people about their social lives and what they did the night before.' };
+    }
+    return null;
+  }
+
   function choiceIndexes(labels, hints, count, random = Math.random) {
     const normalized = labels.map(normalize);
     const matches = normalized.flatMap((label, index) => hints.some(hint => {
@@ -145,7 +174,11 @@
   const shown = (selector, root) => all(selector, root).filter(visible);
   const text = el => (el?.innerText ?? el?.textContent ?? '').trim();
   const pageRoot = () => document.querySelector('#pageLayout');
-  const activeSection = () => all('li.active.courseware a[title]').find(el => sectionTitle.test(el.title));
+  const activeCatalogSection = () => all('li.active.courseware a[title]').find(el => /^\d+-\d+\b/.test(el.title));
+  const activeSection = () => {
+    const section = activeCatalogSection();
+    return section && sectionTitle.test(section.title) ? section : undefined;
+  };
   const activeLesson = () => all(lectureTabs).find(el => el.closest('li')?.classList.contains('active'));
   const activeCircle = () => document.querySelector(numberedTabs + '.selected');
   const sectionLinks = () => all('li.courseware a[title]').filter(el => sectionTitle.test(el.title));
@@ -168,12 +201,11 @@
   let resumeTimer;
 
   function load() {
-    const defaults = { fillOnly: true, auto: false, section: '', unitSections: {}, visits: {}, records: {} };
+    const defaults = { fillOnly: true, auto: false, visits: {}, records: {} };
     try {
       const cached = JSON.parse(localStorage.getItem(storageKey) ?? '{}');
       if (cached.fillOnly) return { ...defaults, ...cached };
-      return { ...defaults, ...cached, fillOnly: true, auto: false, section: '',
-        unitSections: {}, visits: {} };
+      return { ...defaults, ...cached, fillOnly: true, auto: false, visits: {} };
     } catch {
       return defaults;
     }
@@ -186,15 +218,6 @@
   function saveRecord(key, record) {
     state.records[key] = { ...state.records[key], ...record, hash: location.hash };
     persist();
-  }
-
-  function setSectionCursor(title) {
-    if (currentUnit) {
-      if (title) state.unitSections[currentUnit] = title;
-      else delete state.unitSections[currentUnit];
-    } else {
-      state.section = title;
-    }
   }
 
   function renderAttention() {
@@ -233,12 +256,15 @@
     const records = Object.values(state.records);
     const counts = records.reduce((totals, record) => {
       totals[record.state] = (totals[record.state] || 0) + 1;
+      if (record.platformConfirmed && record.state !== 'confirmed') totals.confirmed = (totals.confirmed ?? 0) + 1;
       totals.guessed += record.guessed ?? 0;
+      totals.examples += record.examples ?? 0;
       return totals;
-    }, { guessed: 0 });
+    }, { guessed: 0, examples: 0 });
     panelMessage.textContent = prefix + ' | 已确认 ' + (counts.confirmed ?? 0) +
       ' · 已填写 ' + (counts.draft ?? 0) +
       ' · 猜填 ' + counts.guessed + ' · 待确认 ' + (counts.pending ?? 0) +
+      (counts.examples ? ' · 示例 ' + counts.examples : '') +
       ' · 未完成 ' + (counts.failed ?? 0) +
       ' · 待录音 ' + (counts.recording ?? 0) +
       ((counts['rate-limited'] ?? 0) ? ' · 限频 ' + counts['rate-limited'] : '');
@@ -303,10 +329,7 @@
     const key = baseHash();
     const previous = state.records[key];
     const section = activeSection()?.title;
-    if (section) {
-      setSectionCursor(section);
-      delete state.visits[section];
-    }
+    if (section) delete state.visits[section];
     state.auto = false;
     state.resumeAfter = Date.now() + 5 * 60 * 1000;
     state.resumePlan = state.rateRecoveryUsed ? null : {
@@ -385,7 +408,7 @@
   function choiceGroups(root) {
     const containers = shown('ul[class*="choice--options"]', root);
     return containers.flatMap(container => {
-      const inputs = shown('input[type="radio"],input[type="checkbox"]', container);
+      const inputs = shown('input[type="radio"],input[type="checkbox"]', container).filter(writable);
       return inputs.length ? [inputs] : [];
     });
   }
@@ -469,23 +492,45 @@
     };
   }
 
-  function listeningPage(root) {
-    return Boolean(root && shown('video,[class*="audio--aplayer"]', root).length);
+  function writable(el) {
+    return !el.disabled && !el.readOnly && !el.closest('[aria-disabled="true"]') &&
+      !el.matches('[class*="--bc-review"],[class*="writing--review"]');
+  }
+
+  function editableSelects(root) {
+    return shown('select', root).filter(el => writable(el) && !el.closest('.video-js'));
+  }
+
+  function isBlankSequence(table) {
+    const cards = readCards(table);
+    const captions = cards.map(card => normalize(text(card.querySelector('[class*="caption-item"]'))));
+    return cards.length > 1 && cards.some(card => card.draggable) &&
+      captions.every(label => /^[a-z]$/.test(label)) &&
+      captions.join('') === [...captions].sort().join('');
+  }
+
+  function hasBlankControls(root) {
+    if (!root) return false;
+    return shown(textInputSelector, root).some(el => writable(el) && !el.value.trim()) ||
+      choiceGroups(root).some(group => group.every(el => !el.checked)) ||
+      editableSelects(root).some(el => !el.value && [...el.options].some(option => option.value && !option.disabled)) ||
+      shown('table[class*="sequence-table"]', root).some(isBlankSequence);
   }
 
   async function fillPage(root, signal, sequencePlans, rememberSequence, interrupted) {
     const context = text(root);
     const choice = choiceGroups(root);
-    const fields = shown('input[class*="fill-blank--"],textarea.scoopFill_textarea', root)
-      .filter(el => !el.disabled && !el.readOnly);
-    const tables = shown('table[class*="sequence-table"]', root);
-    const selects = shown('select', root).filter(el => !el.disabled && !el.closest('.video-js'));
+    const fields = shown(textInputSelector, root).filter(writable);
+    const tables = shown('table[class*="sequence-table"]', root).filter(table => readCards(table).some(card => card.draggable));
+    const selects = editableSelects(root);
     const usedInputs = new Set([...choice.flat(), ...fields, ...selects]);
     const unknown = shown('input:not([type="hidden"]),textarea,select,[draggable="true"]', root)
-      .some(el => !el.disabled && !el.readOnly && !usedInputs.has(el) &&
+      .some(el => writable(el) && !usedInputs.has(el) &&
         !el.closest('.video-js, [class*="audio--aplayer"], table[class*="sequence-table"]'));
     const total = choice.length + fields.length + tables.length + selects.length;
     let guessed = 0;
+    let examples = 0;
+    let unmatchedWriting = false;
     let verified = !unknown;
     const step = Number(stepLabel().split('/')[0]) || 1;
 
@@ -507,12 +552,17 @@
       }
       const nearby = input.previousSibling?.textContent ??
         input.parentElement?.previousSibling?.textContent ?? context;
-      let result = fieldAnswer(context, nearby, index, fields.length);
-      if (/write down its general idea/.test(normalize(context)) && answerLeaf() === 'u1g6') {
-        result = { text: 'Hina asks people about their social lives and what they did the night before.', guessed: false };
+      const result = input.tagName === 'TEXTAREA'
+        ? writtenAnswer(context, nearby, index, fields.length)
+        : fieldAnswer(context, nearby, index, fields.length);
+      if (!result) {
+        unmatchedWriting = true;
+        verified = false;
+        continue;
       }
       verified = writeText(input, result.text) && verified;
-      guessed += Number(result.guessed);
+      guessed += Number(Boolean(result.guessed));
+      examples += Number(Boolean(result.example));
     }
 
     const used = new Set(selects.filter(el => el.value).map(el => el.value));
@@ -535,21 +585,23 @@
       verified = result.verified && verified;
       guessed += result.guessed;
     }
-    return { total, guessed, verified };
+    return { total, guessed, examples, unmatchedWriting, verified };
   }
 
   async function processLeaf(signal) {
     const key = baseHash();
     const label = taskLabel();
     let record = state.records[key] ?? { label, guessed: 0 };
+    if (pageBlocked()) return 'stopped';
+    if (/(?:\/review(?:\/|$|\?)|[?&]mode=review\b)/.test(location.hash)) return 'outside';
+    const platformConfirmed = record.state === 'confirmed' || record.platformConfirmed ||
+      ['confirmed', 'already'].includes(inspectReceipt());
     const save = update => {
-      record = { ...record, ...update, label };
+      record = { ...record, ...update, label, platformConfirmed };
       saveRecord(key, record);
     };
-    if (pageBlocked()) return 'stopped';
-    if (record.state === 'confirmed') return 'confirmed';
-    if (['confirmed', 'already'].includes(inspectReceipt())) {
-      save({ state: 'confirmed', message: '平台已确认' });
+    if (platformConfirmed && !hasBlankControls(pageRoot())) {
+      if (record.state !== 'draft') save({ state: 'confirmed', message: '平台已确认' });
       return 'confirmed';
     }
 
@@ -561,7 +613,7 @@
         save({ state: 'recording', message: '待录音，请在课程页使用麦克风完成跟读' });
         return 'recording';
       }
-      if (!listeningPage(root)) return 'outside';
+      if (!root) return 'outside';
       const stepName = stepLabel();
       const sequencePlans = { ...record.sequencePlans?.[stepName] };
       const interrupted = record.state === 'failed' && answerLeaf() === 'u1g26';
@@ -577,15 +629,19 @@
         return 'outside';
       }
       if (!result.total || !result.verified) {
-        save({ state: 'failed', message: result.total ? '题目控件未能读回所填答案' : '未发现可填写的听力题控件' });
+        save({ state: 'failed', message: result.unmatchedWriting ? '简答题暂无对应草稿' :
+          result.total ? '题目控件未能读回所填答案' : '未发现支持的答题控件' });
         return 'failed';
       }
       const stepNotes = { ...record.stepNotes, [stepName]: result.guessed || record.stepNotes?.[stepName] || 0 };
+      const stepExamples = { ...record.stepExamples, [stepName]: result.examples || record.stepExamples?.[stepName] || 0 };
       save({
         state: next ? 'progress' : 'draft',
         stepNotes,
+        stepExamples,
         guessed: Object.values(stepNotes).reduce((a, b) => a + b, 0),
-        message: next ? '正在填写' : '已填写，提交状态以平台为准',
+        examples: Object.values(stepExamples).reduce((a, b) => a + b, 0),
+        message: next ? '正在填写' : result.examples ? '已填写示例草稿，请按自己的情况调整' : '已填写，提交状态以平台为准',
       });
       if (!next) return 'draft';
       if (!await navigate(next, signal)) {
@@ -607,7 +663,7 @@
   function nextLesson() {
     const tabs = shown(lectureTabs);
     const current = tabs.findIndex(el => el === activeLesson());
-    return current >= 0 ? tabs.slice(current + 1).find(el => !/^(?:think and speak|think and share)$/i.test(text(el))) : undefined;
+    return current >= 0 ? tabs[current + 1] : undefined;
   }
 
   async function openSection(title, signal) {
@@ -652,22 +708,20 @@
       return '本页：' + (state.records[baseHash()]?.message ?? '未发现可填写内容');
     }
 
+    const position = title => {
+      const match = /^(\d+)-(\d+)\b/.exec(title ?? '');
+      return match ? Number(match[1]) * 100 + Number(match[2]) : 0;
+    };
+    const current = position(activeCatalogSection()?.title);
+    if (!current) return '未能识别当前小节，请先打开一页课件';
     const sections = [...new Set(sectionLinks().map(link => link.title))]
-      .filter(title => !currentUnit || title.startsWith(currentUnit + '-'));
-    if (!sections.length) return '没有读到教材听力目录';
-    const cursor = currentUnit ? state.unitSections[currentUnit] : state.section;
-    const index = Math.max(0, sections.indexOf(cursor));
-    for (const title of sections.slice(index)) {
+      .filter(title => position(title) >= current && (!currentUnit || title.startsWith(currentUnit + '-')));
+    if (!sections.length) return '当前范围内没有后续听力小节';
+    for (const title of sections) {
       if (signal.aborted) return '已停止';
-      setSectionCursor(title);
-      persist();
       const done = await runSection(title, signal);
       if (signal.aborted) return '已停止';
       state.visits[title] = done ? 'finished' : 'unreached';
-      persist();
-    }
-    if (!signal.aborted) {
-      setSectionCursor('');
       persist();
     }
     const unreachable = sections.filter(title => state.visits[title] === 'unreached').length;
@@ -754,15 +808,64 @@
     }
   }
 
+  function enablePanelDrag(panel, handle, details) {
+    const positionKey = storageKey + '.panelPosition';
+    let drag;
+    let position;
+    const place = (x, y) => {
+      const bounds = panel.getBoundingClientRect();
+      const width = document.documentElement.clientWidth || window.innerWidth;
+      const height = document.documentElement.clientHeight || window.innerHeight;
+      position = {
+        x: Math.round(Math.max(0, Math.min(x, width - bounds.width))),
+        y: Math.round(Math.max(0, Math.min(y, height - bounds.height))),
+      };
+      panel.style.left = position.x + 'px';
+      panel.style.top = position.y + 'px';
+      panel.style.bottom = 'auto';
+    };
+    try {
+      const stored = JSON.parse(localStorage.getItem(positionKey) ?? 'null');
+      if (Number.isFinite(stored?.x) && Number.isFinite(stored?.y)) place(stored.x, stored.y);
+    } catch {
+      // An invalid saved position falls back to the default placement.
+    }
+    handle.addEventListener('pointerdown', event => {
+      if (event.button !== 0 || drag) return;
+      const bounds = panel.getBoundingClientRect();
+      drag = { id: event.pointerId, offsetX: event.clientX - bounds.left, offsetY: event.clientY - bounds.top };
+      handle.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+    });
+    handle.addEventListener('pointermove', event => {
+      if (!drag || event.pointerId !== drag.id) return;
+      place(event.clientX - drag.offsetX, event.clientY - drag.offsetY);
+    });
+    const finishDrag = event => {
+      if (!drag || event.pointerId !== drag.id) return;
+      drag = undefined;
+      if (position) localStorage.setItem(positionKey, JSON.stringify(position));
+    };
+    handle.addEventListener('pointerup', finishDrag);
+    handle.addEventListener('pointercancel', finishDrag);
+    handle.addEventListener('lostpointercapture', finishDrag);
+    const fitViewport = () => {
+      if (position && !drag) place(position.x, position.y);
+    };
+    window.addEventListener('resize', fitViewport);
+    details.addEventListener('toggle', fitViewport);
+  }
+
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.5';
+    panel.dataset.version = '0.1.6';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
     title.textContent = 'U校园听力助手';
-    title.title = 'Unit 1 已核对答案来源：' + transcriptUrl;
+    title.title = '拖动标题移动面板。Unit 1 已核对答案来源：' + transcriptUrl;
+    title.style.cssText = 'display:block;cursor:grab;touch-action:none;user-select:none';
     const actions = document.createElement('div');
     const makeButton = (label, action) => {
       const el = document.createElement('button');
@@ -801,6 +904,7 @@
     attention.append(attentionSummary, attentionList);
     panel.append(title, actions, panelMessage, attention);
     document.body.append(panel);
+    enablePanelDrag(panel, title, attention);
     state = load();
     summarize(state.resumeAfter > Date.now() || state.resumePlan ? cooldownStatus() : '就绪');
     dismissStudyNotice();
