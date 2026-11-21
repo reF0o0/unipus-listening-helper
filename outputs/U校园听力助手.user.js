@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.6
+// @version      0.1.7
 // @description  自动填写并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -14,6 +14,8 @@
 
   const courseRoute = /^#\/course-v1:Unipus\+nhce_3_vls_1_sz\+2021_08\/courseware\/u([1-8])\//;
   const sectionTitle = /^[1-8]-(?:2 Sharing|3 Listening|4 Viewing|8 More practice in listening)$/i;
+  const rolePlayingTitle = /^1-6 Role-playing$/i;
+  const supportedSection = title => sectionTitle.test(title) || rolePlayingTitle.test(title);
   const lectureTabs = '#header ul.TabsBox a.topTab';
   const numberedTabs = '#header [class*="circleTabsBox"] a';
   const submitBar = '[class*="submit-bar-pc--container"]';
@@ -43,8 +45,11 @@
     [/baruti was born in johannesburg.*long walk to freedom/, ['teacher', 'cleaned houses', 'lost', 'visited', 'work', 'his wife', 'in his own words']],
     [/i have a 1 social life.*old friend from.*do you go out a lot/, ['busy', 'friends', 'university', 'social life']],
     [/went to a club.*westfield shopping center.*south london/, ['danced', 'view', 'fun', 'drink', 'west', 'delicious meal', 'house', 'TV']],
+    [/part 1 of the conversation and fill in the blanks.*i went for a walk.*with my boyfriend diego.*by the river/,
+      ['It was great', "He's a football player", 'It was really beautiful']],
     [/so many changes when a person comes to college.*(parents around|college life)/, ['programmes', 'very', 'decisions', 'doing laundry', 'Obviously', 'choices', 'ruining', 'get used to', 'opportunities', 'step back']],
   ];
+  const rolePlayingExpressions = ['And you?', 'What did you do?', 'Really?', 'Where did you play?', "I don't believe you!"];
   const audioChoices = {
     u1g56: [
       ['at home'],
@@ -177,11 +182,12 @@
   const activeCatalogSection = () => all('li.active.courseware a[title]').find(el => /^\d+-\d+\b/.test(el.title));
   const activeSection = () => {
     const section = activeCatalogSection();
-    return section && sectionTitle.test(section.title) ? section : undefined;
+    return section && supportedSection(section.title) ? section : undefined;
   };
   const activeLesson = () => all(lectureTabs).find(el => el.closest('li')?.classList.contains('active'));
+  const noteThemDown = () => normalize(text(activeLesson())) === 'note them down';
   const activeCircle = () => document.querySelector(numberedTabs + '.selected');
-  const sectionLinks = () => all('li.courseware a[title]').filter(el => sectionTitle.test(el.title));
+  const sectionLinks = () => all('li.courseware a[title]').filter(el => supportedSection(el.title));
   const stepLabel = () => text(document.querySelector('#pageLayout [class*="pclayout--step-"]')) || '1/1';
   const baseHash = () => location.hash.replace(/\/(?:__main|p_\d+)$/, '');
   const unitOfHash = hash => courseRoute.exec(hash)?.[1] ?? '';
@@ -533,13 +539,23 @@
     let unmatchedWriting = false;
     let verified = !unknown;
     const step = Number(stepLabel().split('/')[0]) || 1;
+    const partTwo = rolePlayingTitle.test(activeSection()?.title) &&
+      /part 2 of the conversation and check the ones you hear/.test(normalize(context));
 
     for (const [index, inputs] of choice.entries()) {
       if (signal.aborted || pageBlocked()) return { total, guessed, verified: false };
-      if (inputs.some(input => input.checked)) continue;
-      const hints = audioChoices[answerLeaf()]?.[step - 1 + index] ?? [];
-      const result = choiceIndexes(inputs.map(choiceLabel), hints, pickCount(inputs, context));
-      for (const selected of result.indexes) inputs[selected].click();
+      if (!partTwo && inputs.some(input => input.checked)) continue;
+      const hints = partTwo ? rolePlayingExpressions : audioChoices[answerLeaf()]?.[step - 1 + index] ?? [];
+      const count = partTwo ? hints.length : pickCount(inputs, context);
+      const result = choiceIndexes(inputs.map(choiceLabel), hints, count);
+      if (partTwo && (result.guessed || inputs[0].type !== 'checkbox' ||
+          inputs.some((input, index) => input.checked && !result.indexes.includes(index)))) {
+        verified = false;
+        continue;
+      }
+      for (const selected of result.indexes) {
+        if (!inputs[selected].checked) inputs[selected].click();
+      }
       verified = result.indexes.every(selected => inputs[selected].checked) && verified;
       guessed += Number(result.guessed);
     }
@@ -679,14 +695,16 @@
 
   async function runSection(title, signal) {
     if (!await openSection(title, signal)) return false;
+    const isRolePlaying = rolePlayingTitle.test(title);
     for (let leaf = 0; leaf < 32 && !signal.aborted; leaf++) {
       if (activeSection()?.title !== title || (currentUnit && unitOfHash(location.hash) !== currentUnit)) return false;
+      if (isRolePlaying && !noteThemDown()) return true;
       summarize('运行中：' + taskLabel());
       const before = baseHash();
       const result = await processLeaf(signal);
       if (signal.aborted) return false;
       if (result === 'moved' || baseHash() !== before) continue;
-      const next = nextCircle() ?? nextLesson();
+      const next = nextCircle() ?? (isRolePlaying ? undefined : nextLesson());
       if (!next) return true;
       if (!await navigate(next, signal)) return false;
     }
@@ -701,7 +719,9 @@
     }
     if (!await stablePage(signal)) return '等待课件加载超时';
     if (mode === 'sample') {
-      if (!activeSection()) return '请打开一页教材听力练习验收';
+      const section = activeSection();
+      if (!section) return '请打开一页支持填写的教材听力练习';
+      if (rolePlayingTitle.test(section.title) && !noteThemDown()) return '1-6 仅支持 Note them down 的两页听力练习';
       const result = await processLeaf(signal);
       if (result === 'confirmed') return '本页已有完成记录';
       if (result === 'draft') return '本页已填写';
@@ -859,7 +879,7 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.6';
+    panel.dataset.version = '0.1.7';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
