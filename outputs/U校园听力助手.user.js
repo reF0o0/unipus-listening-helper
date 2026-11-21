@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         U校园听力助手
 // @namespace    local.u-campus.listening
-// @version      0.1.8
+// @version      0.1.9
 // @description  自动填写并切换本课程的教材听力练习
 // @match        https://ucontent.unipus.cn/_pc_default/pc.html*
 // @run-at       document-idle
@@ -427,16 +427,22 @@
   }
 
   function choiceGroups(root) {
-    const containers = shown('ul[class*="choice--options"]', root);
-    return containers.flatMap(container => {
-      const inputs = shown('input[type="radio"],input[type="checkbox"]', container).filter(writable);
-      return inputs.length ? [inputs] : [];
-    });
+    const singleList = 'ul[class*="choice--options"]';
+    const multipleRow = '[class*="MultipleChoice--checkbox-item-"]';
+    const controls = `${singleList} input:is([type="radio"],[type="checkbox"]), ${multipleRow} input[type="checkbox"]`;
+    const groups = new Map();
+    for (const input of shown(controls, root).filter(writable)) {
+      const options = input.closest(multipleRow)?.parentElement ?? input.closest(singleList);
+      const group = groups.get(options);
+      if (group) group.push(input);
+      else groups.set(options, [input]);
+    }
+    return [...groups.values()];
   }
 
   function choiceLabel(input) {
     const label = input.closest('label');
-    return text(label?.querySelector('[class*="choice--content"]') ?? label)
+    return text(label?.querySelector('[class*="choice--content"], [class*="MultipleChoice--checkbox-content-"]') ?? label)
       .replace(/^[A-Z]\s*[.)]\s*/, '');
   }
 
@@ -569,9 +575,13 @@
         continue;
       }
       for (const selected of result.indexes) {
-        if (!inputs[selected].checked) inputs[selected].click();
+        if (signal.aborted || pageBlocked()) return { total, guessed, verified: false };
+        const input = inputs[selected];
+        if (!input.isConnected || input.checked) continue;
+        input.click();
+        if (input.type === 'checkbox') await delay(0);
       }
-      verified = result.indexes.every(selected => inputs[selected].checked) && verified;
+      verified = result.indexes.every(selected => inputs[selected].isConnected && inputs[selected].checked) && verified;
       guessed += Number(result.guessed);
     }
 
@@ -894,7 +904,7 @@
   function mount() {
     const panel = document.createElement('section');
     panel.id = 'unipus-listening-helper';
-    panel.dataset.version = '0.1.8';
+    panel.dataset.version = '0.1.9';
     panel.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:1250;max-width:min(420px,calc(100vw - 60px));background:#fff;color:#172b35;border:1px solid #a0b7c0;border-radius:8px;padding:10px 12px;box-shadow:0 2px 12px #12121228;font:13px/1.5 system-ui,sans-serif';
     panel.setAttribute('aria-label', 'U校园听力助手');
     const title = document.createElement('strong');
